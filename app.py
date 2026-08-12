@@ -10,28 +10,19 @@ from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from transformers import pipeline
 import google.generativeai as genai
+
 # 1. THIS MUST BE THE VERY FIRST STREAMLIT COMMAND
 st.set_page_config(page_title="Quant Trade & Risk Engine", page_icon="⚡", layout="wide")
 
-# 2. Initialize the session state
+# 2. Initialize session state
 if "model_run" not in st.session_state:
     st.session_state.model_run = False
-
-# 3. The Button updates the state
-if st.sidebar.button("Run Quantitative Model"):
-    st.session_state.model_run = True
-
-# 4. Stop the app from loading the rest of the code if False
-if not st.session_state.model_run:
-    st.info("👈 Please configure your parameters and click 'Run Quantitative Model' to begin.")
-    st.stop()  # This safely halts the script here!
 
 # ==========================================
 # 1. ML SENTIMENT ENGINE (FinBERT HuggingFace)
 # ==========================================
 @st.cache_resource(show_spinner="Loading FinBERT NLP Model...")
 def load_finbert():
-# ... the rest of your code stays exactly as it is, no indenting needed!
     try:
         return pipeline("text-classification", model="ProsusAI/finbert", top_k=None)
     except Exception:
@@ -351,7 +342,7 @@ def compute_calibration(scored_df, min_n=20):
     return cal, len(usable)
 
 # ------------------------------------------------------------------------
-# STREAMLIT UI LAYOUT
+# STREAMLIT UI LAYOUT & SIDEBAR
 # ------------------------------------------------------------------------
 st.title("⚡ Quantitative Trade & Risk Engine")
 st.markdown("XGBoost Predictive Targets, FinBERT Sentiment & Position Sizing")
@@ -373,196 +364,208 @@ portfolio_capital = st.sidebar.number_input(f"Available Capital ({sym})", value=
 holding_days = st.sidebar.slider("Holding Horizon (Trading Days)", min_value=1, max_value=60, value=10)
 max_risk_pct = st.sidebar.slider("Max Acceptable Loss Limit (%)", min_value=1.0, max_value=20.0, value=7.0, step=0.5)
 
+# Single primary action button updates session state
 if st.sidebar.button("Run Quantitative Model", type="primary"):
-    with st.spinner(f"Running ML models & analytics for {ticker}..."):
-        s0, daily_vol, annual_vol, log_returns, price_series, tk = fetch_stock_data(ticker)
-        
-        if s0 is None:
-            st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
+    st.session_state.model_run = True
+
+# Safely halt execution if model run hasn't been triggered yet
+if not st.session_state.model_run:
+    st.info("👈 Please configure your parameters in the sidebar and click 'Run Quantitative Model' to begin.")
+    st.stop()
+
+# ------------------------------------------------------------------------
+# MAIN DASHBOARD EXECUTION
+# ------------------------------------------------------------------------
+with st.spinner(f"Running ML models & analytics for {ticker}..."):
+    s0, daily_vol, annual_vol, log_returns, price_series, tk = fetch_stock_data(ticker)
+
+if s0 is None:
+    st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
+    st.stop()
+
+entry_price = entry_price_input if entry_price_input > 0 else s0
+
+rsi, sma_20, sma_50, bb_upper, bb_lower, macd_hist = compute_technical_indicators(price_series)
+var_param_usd, cvar_usd = compute_risk_metrics(log_returns, s0, holding_days)
+pop_pct, p05, p95 = run_monte_carlo(s0, entry_price, daily_vol, holding_days)
+news_items, sentiment_score = fetch_news_and_sentiment(tk)
+prob_dip, dip_model_acc = train_xgboost_entry_model(price_series)
+
+optimal_buy, conservative_buy = calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip)
+optimal_sell, aggressive_sell, sigma_h_exit = calculate_optimal_sell_target(
+    s0, daily_vol, bb_upper, sma_20, rsi, sentiment_score, holding_days
+)
+sigma_period = daily_vol * np.sqrt(holding_days)
+target_tp = entry_price * (1 + 1.5 * sigma_period)
+quant_sl = entry_price * (1 - 1.0 * sigma_period)
+user_sl = entry_price * (1 - max_risk_pct / 100.0)
+target_sl = max(quant_sl, user_sl)
+
+rec_shares, total_alloc = calculate_position_sizing(portfolio_capital, entry_price, is_bursa)
+
+log_prediction(ticker, s0, optimal_buy, optimal_sell, prob_dip, holding_days)
+
+# --- DISPLAY DASHBOARD METRICS ---
+st.subheader("🎯 3-Day ML Optimal Buy Price Target")
+b_col1, b_col2, b_col3, b_col4 = st.columns(4)
+b_col1.metric("Current Spot Price", f"{sym}{s0:.2f}")
+b_col2.metric("Target Limit Buy Entry", f"{sym}{optimal_buy:.2f}", f"{((optimal_buy-s0)/s0)*100:+.2f}%")
+b_col3.metric("Conservative Entry", f"{sym}{conservative_buy:.2f}", f"{((conservative_buy-s0)/s0)*100:+.2f}%")
+acc_label = f"{dip_model_acc*100:.0f}% holdout acc" if dip_model_acc is not None else "not enough history to validate"
+b_col4.metric("XGBoost Dip Probability", f"{prob_dip*100:.1f}%", acc_label, delta_color="off")
+
+st.markdown("---")
+
+st.subheader("💰 Optimal Sell Price Recommendation")
+s_col1, s_col2, s_col3 = st.columns(3)
+s_col1.metric("Current Spot Price", f"{sym}{s0:.2f}")
+s_col2.metric("Target Sell Price", f"{sym}{optimal_sell:.2f}", f"{((optimal_sell-s0)/s0)*100:+.2f}%")
+s_col3.metric("Aggressive Sell Price", f"{sym}{aggressive_sell:.2f}", f"{((aggressive_sell-s0)/s0)*100:+.2f}%")
+st.caption(f"Based on resistance (BB-upper/SMA-20), {holding_days}d volatility, sentiment, and RSI.")
+
+st.markdown("---")
+
+st.subheader("📊 Position Sizing & Target Limits")
+p_col1, p_col2, p_col3, p_col4 = st.columns(4)
+p_col1.metric("Target Take Profit", f"{sym}{target_tp:.2f}")
+p_col2.metric("Dynamic Stop Loss", f"{sym}{target_sl:.2f}")
+
+if is_bursa:
+    unit_str = f"{int(rec_shares // 100)}"
+    unit_label = "lots"
+else:
+    unit_str = f"{rec_shares:.4f}".rstrip('0').rstrip('.') if rec_shares % 1 != 0 else f"{int(rec_shares)}"
+    unit_label = "units"
+    
+p_col3.metric("Recommended Allocation", f"{unit_str} {unit_label}")
+p_col4.metric("Capital Allocation", f"{sym}{total_alloc:,.2f}")
+
+st.markdown("---")
+
+# --- PLOTLY CHART ---
+st.subheader("📈 Technical Level Chart")
+series_tail = pd.Series(price_series).tail(120)
+df_chart = pd.DataFrame({"Close": series_tail})
+df_chart["BB_Upper"] = df_chart["Close"].rolling(20).mean() + 2 * df_chart["Close"].rolling(20).std()
+df_chart["BB_Lower"] = df_chart["Close"].rolling(20).mean() - 2 * df_chart["Close"].rolling(20).std()
+
+fig = go.Figure()
+fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["Close"], name="Close Price", line=dict(color="white", width=2)))
+fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["BB_Upper"], name="BB Upper", line=dict(color="gray", dash="dash")))
+fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["BB_Lower"], name="BB Lower", line=dict(color="gray", dash="dash")))
+
+fig.add_hline(y=optimal_buy, line_color="cyan", line_dash="dash", annotation_text="Target Buy Limit")
+fig.add_hline(y=optimal_sell, line_color="lime", line_dash="dash", annotation_text="Target Sell")
+fig.add_hline(y=target_tp, line_color="green", line_dash="dot", annotation_text="Take Profit")
+fig.add_hline(y=target_sl, line_color="red", line_dash="dash", annotation_text="Stop Loss")
+
+fig.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=30, b=20))
+st.plotly_chart(fig, use_container_width=True)
+
+st.markdown("---")
+
+# --- DETAILED TABS ---
+tab_backtest, tab_news, tab_risk, tab_mc, tab_track, tab_ai = st.tabs([
+    "🧪 Historical Strategy Backtest", "📰 FinBERT News Feed", "⚠️ Risk Matrix", "🎲 Monte Carlo", "📒 Track Record", "🤖 AI Analyst"
+])
+
+with tab_backtest:
+    win_rate, total_ret, sharpe, max_dd = backtest_strategy(price_series, holding_days)
+    bt1, bt2, bt3, bt4 = st.columns(4)
+    bt1.metric("Historical Win Rate", f"{win_rate:.1f}%")
+    bt2.metric("Cumulative Strategy Return", f"{total_ret:+.2f}%")
+    bt3.metric("Sharpe Ratio", f"{sharpe:.2f}")
+    bt4.metric("Max Drawdown", f"{max_dd:.2f}%")
+
+with tab_news:
+    st.write(f"**FinBERT Sentiment Index:** `{sentiment_score:+.3f}`")
+    for n in news_items:
+        score_tag = "🟢 Bullish" if n["score"] > 0.1 else "🔴 Bearish" if n["score"] < -0.1 else "⚪ Neutral"
+        st.markdown(f"- **[{n['title']}]({n['link']})** ({n['publisher']}) — *{score_tag} ({n['score']:+.2f})*")
+
+with tab_risk:
+    st.write(f"**95% Parametric VaR:** `{sym}{var_param_usd:.2f}` potential risk limit")
+    st.write(f"**CVaR Tail Loss:** `{sym}{cvar_usd:.2f}`")
+
+with tab_mc:
+    st.write(f"**Probability of Profit (PoP):** `{pop_pct:.1f}%`")
+    st.write(f"**5th–95th Tail Percentiles:** `{sym}{p05:.2f}` to `{sym}{p95:.2f}`")
+
+with tab_track:
+    st.caption("Every run logs itself automatically.")
+    history = load_prediction_history()
+    if history.empty:
+        st.info("No predictions logged yet.")
+    else:
+        st.write(f"**{len(history)} predictions logged** across {history['Ticker'].nunique()} ticker(s).")
+        with st.spinner("Scoring past predictions..."):
+            scored = score_prediction_history(history)
+
+        if scored.empty:
+            st.warning("Couldn't fetch price data to score against.")
         else:
-            entry_price = entry_price_input if entry_price_input > 0 else s0
-            
-            rsi, sma_20, sma_50, bb_upper, bb_lower, macd_hist = compute_technical_indicators(price_series)
-            var_param_usd, cvar_usd = compute_risk_metrics(log_returns, s0, holding_days)
-            pop_pct, p05, p95 = run_monte_carlo(s0, entry_price, daily_vol, holding_days)
-            news_items, sentiment_score = fetch_news_and_sentiment(tk)
-            prob_dip, dip_model_acc = train_xgboost_entry_model(price_series)
-            
-            optimal_buy, conservative_buy = calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip)
-            optimal_sell, aggressive_sell, sigma_h_exit = calculate_optimal_sell_target(
-                s0, daily_vol, bb_upper, sma_20, rsi, sentiment_score, holding_days
-            )
-            sigma_period = daily_vol * np.sqrt(holding_days)
-            target_tp = entry_price * (1 + 1.5 * sigma_period)
-            quant_sl = entry_price * (1 - 1.0 * sigma_period)
-            user_sl = entry_price * (1 - max_risk_pct / 100.0)
-            target_sl = max(quant_sl, user_sl)
-            
-            rec_shares, total_alloc = calculate_position_sizing(portfolio_capital, entry_price, is_bursa)
-
-            log_prediction(ticker, s0, optimal_buy, optimal_sell, prob_dip, holding_days)
-
-            # --- DISPLAY DASHBOARD METRICS ---
-            st.subheader("🎯 3-Day ML Optimal Buy Price Target")
-            b_col1, b_col2, b_col3, b_col4 = st.columns(4)
-            b_col1.metric("Current Spot Price", f"{sym}{s0:.2f}")
-            b_col2.metric("Target Limit Buy Entry", f"{sym}{optimal_buy:.2f}", f"{((optimal_buy-s0)/s0)*100:+.2f}%")
-            b_col3.metric("Conservative Entry", f"{sym}{conservative_buy:.2f}", f"{((conservative_buy-s0)/s0)*100:+.2f}%")
-            acc_label = f"{dip_model_acc*100:.0f}% holdout acc" if dip_model_acc is not None else "not enough history to validate"
-            b_col4.metric("XGBoost Dip Probability", f"{prob_dip*100:.1f}%", acc_label, delta_color="off")
-
-            st.markdown("---")
-
-            st.subheader("💰 Optimal Sell Price Recommendation")
-            s_col1, s_col2, s_col3 = st.columns(3)
-            s_col1.metric("Current Spot Price", f"{sym}{s0:.2f}")
-            s_col2.metric("Target Sell Price", f"{sym}{optimal_sell:.2f}", f"{((optimal_sell-s0)/s0)*100:+.2f}%")
-            s_col3.metric("Aggressive Sell Price", f"{sym}{aggressive_sell:.2f}", f"{((aggressive_sell-s0)/s0)*100:+.2f}%")
-            st.caption(f"Based on resistance (BB-upper/SMA-20), {holding_days}d volatility, sentiment, and RSI.")
-
-            st.markdown("---")
-
-            st.subheader("📊 Position Sizing & Target Limits")
-            p_col1, p_col2, p_col3, p_col4 = st.columns(4)
-            p_col1.metric("Target Take Profit", f"{sym}{target_tp:.2f}")
-            p_col2.metric("Dynamic Stop Loss", f"{sym}{target_sl:.2f}")
-            
-            if is_bursa:
-                unit_str = f"{int(rec_shares // 100)}"
-                unit_label = "lots"
+            evaluated = scored[scored["Status"] == "Evaluated"]
+            if not evaluated.empty:
+                sc1, sc2 = st.columns(2)
+                buy_rate = evaluated["Buy_Hit"].dropna().mean() * 100 if evaluated["Buy_Hit"].notna().any() else None
+                sell_rate = evaluated["Sell_Hit"].dropna().mean() * 100 if evaluated["Sell_Hit"].notna().any() else None
+                sc1.metric("Buy target hit rate", f"{buy_rate:.0f}%" if buy_rate is not None else "N/A", f"n={evaluated['Buy_Hit'].notna().sum()}")
+                sc2.metric("Sell target hit rate", f"{sell_rate:.0f}%" if sell_rate is not None else "N/A", f"n={evaluated['Sell_Hit'].notna().sum()}")
             else:
-                unit_str = f"{rec_shares:.4f}".rstrip('0').rstrip('.') if rec_shares % 1 != 0 else f"{int(rec_shares)}"
-                unit_label = "units"
-                
-            p_col3.metric("Recommended Allocation", f"{unit_str} {unit_label}")
-            p_col4.metric("Capital Allocation", f"{sym}{total_alloc:,.2f}")
+                st.caption("No predictions have reached their full holding horizon yet.")
 
-            st.markdown("---")
+            st.markdown("**Dip probability calibration**")
+            cal, n_usable = compute_calibration(scored)
+            if cal is None:
+                st.caption(f"Need at least 20 resolved predictions to check calibration honestly - you have {n_usable} so far.")
+            else:
+                cal_display = cal.copy()
+                cal_display["avg_predicted"] = (cal_display["avg_predicted"] * 100).round(1).astype(str) + "%"
+                cal_display["actual_hit_rate"] = (cal_display["actual_hit_rate"] * 100).round(1).astype(str) + "%"
+                st.dataframe(cal_display, use_container_width=True)
 
-            # --- PLOTLY CHART ---
-            st.subheader("📈 Technical Level Chart")
-            series_tail = pd.Series(price_series).tail(120)
-            df_chart = pd.DataFrame({"Close": series_tail})
-            df_chart["BB_Upper"] = df_chart["Close"].rolling(20).mean() + 2 * df_chart["Close"].rolling(20).std()
-            df_chart["BB_Lower"] = df_chart["Close"].rolling(20).mean() - 2 * df_chart["Close"].rolling(20).std()
+            st.dataframe(scored, use_container_width=True)
+        st.dataframe(history, use_container_width=True)
 
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["Close"], name="Close Price", line=dict(color="white", width=2)))
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["BB_Upper"], name="BB Upper", line=dict(color="gray", dash="dash")))
-            fig.add_trace(go.Scatter(x=df_chart.index, y=df_chart["BB_Lower"], name="BB Lower", line=dict(color="gray", dash="dash")))
+with tab_ai:
+    st.subheader("🤖 Gemini AI Financial Analyst")
+    st.caption("Ask me anything about your current targets, risk metrics, or market sentiment.")
+    
+    if "GEMINI_API_KEY" in st.secrets:
+        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])  # type: ignore
+        model = genai.GenerativeModel('gemini-1.5-flash')  # type: ignore
+        
+        if "chat_history" not in st.session_state:
+            st.session_state.chat_history = []
             
-            fig.add_hline(y=optimal_buy, line_color="cyan", line_dash="dash", annotation_text="Target Buy Limit")
-            fig.add_hline(y=optimal_sell, line_color="lime", line_dash="dash", annotation_text="Target Sell")
-            fig.add_hline(y=target_tp, line_color="green", line_dash="dot", annotation_text="Take Profit")
-            fig.add_hline(y=target_sl, line_color="red", line_dash="dash", annotation_text="Stop Loss")
+        for msg in st.session_state.chat_history:
+            st.chat_message(msg["role"]).write(msg["content"])
             
-            fig.update_layout(template="plotly_dark", height=400, margin=dict(l=20, r=20, t=30, b=20))
-            st.plotly_chart(fig, use_container_width=True)
-
-            st.markdown("---")
-
-            # --- DETAILED TABS ---
-            tab_backtest, tab_news, tab_risk, tab_mc, tab_track, tab_ai = st.tabs([
-                "🧪 Historical Strategy Backtest", "📰 FinBERT News Feed", "⚠️ Risk Matrix", "🎲 Monte Carlo", "📒 Track Record", "🤖 AI Analyst"
-            ])
-
-            with tab_backtest:
-                win_rate, total_ret, sharpe, max_dd = backtest_strategy(price_series, holding_days)
-                bt1, bt2, bt3, bt4 = st.columns(4)
-                bt1.metric("Historical Win Rate", f"{win_rate:.1f}%")
-                bt2.metric("Cumulative Strategy Return", f"{total_ret:+.2f}%")
-                bt3.metric("Sharpe Ratio", f"{sharpe:.2f}")
-                bt4.metric("Max Drawdown", f"{max_dd:.2f}%")
-
-            with tab_news:
-                st.write(f"**FinBERT Sentiment Index:** `{sentiment_score:+.3f}`")
-                for n in news_items:
-                    score_tag = "🟢 Bullish" if n["score"] > 0.1 else "🔴 Bearish" if n["score"] < -0.1 else "⚪ Neutral"
-                    st.markdown(f"- **[{n['title']}]({n['link']})** ({n['publisher']}) — *{score_tag} ({n['score']:+.2f})*")
-
-            with tab_risk:
-                st.write(f"**95% Parametric VaR:** `{sym}{var_param_usd:.2f}` potential risk limit")
-                st.write(f"**CVaR Tail Loss:** `{sym}{cvar_usd:.2f}`")
-
-            with tab_mc:
-                st.write(f"**Probability of Profit (PoP):** `{pop_pct:.1f}%`")
-                st.write(f"**5th–95th Tail Percentiles:** `{sym}{p05:.2f}` to `{sym}{p95:.2f}`")
-
-            with tab_track:
-                st.caption("Every run logs itself automatically.")
-                history = load_prediction_history()
-                if history.empty:
-                    st.info("No predictions logged yet.")
-                else:
-                    st.write(f"**{len(history)} predictions logged** across {history['Ticker'].nunique()} ticker(s).")
-                    with st.spinner("Scoring past predictions..."):
-                        scored = score_prediction_history(history)
-
-                    if scored.empty:
-                        st.warning("Couldn't fetch price data to score against.")
-                    else:
-                        evaluated = scored[scored["Status"] == "Evaluated"]
-                        if not evaluated.empty:
-                            sc1, sc2 = st.columns(2)
-                            buy_rate = evaluated["Buy_Hit"].dropna().mean() * 100 if evaluated["Buy_Hit"].notna().any() else None
-                            sell_rate = evaluated["Sell_Hit"].dropna().mean() * 100 if evaluated["Sell_Hit"].notna().any() else None
-                            sc1.metric("Buy target hit rate", f"{buy_rate:.0f}%" if buy_rate is not None else "N/A", f"n={evaluated['Buy_Hit'].notna().sum()}")
-                            sc2.metric("Sell target hit rate", f"{sell_rate:.0f}%" if sell_rate is not None else "N/A", f"n={evaluated['Sell_Hit'].notna().sum()}")
-                        else:
-                            st.caption("No predictions have reached their full holding horizon yet.")
-
-                        st.markdown("**Dip probability calibration**")
-                        cal, n_usable = compute_calibration(scored)
-                        if cal is None:
-                            st.caption(f"Need at least 20 resolved predictions to check calibration honestly - you have {n_usable} so far.")
-                        else:
-                            cal_display = cal.copy()
-                            cal_display["avg_predicted"] = (cal_display["avg_predicted"] * 100).round(1).astype(str) + "%"
-                            cal_display["actual_hit_rate"] = (cal_display["actual_hit_rate"] * 100).round(1).astype(str) + "%"
-                            st.dataframe(cal_display, use_container_width=True)
-
-                        st.dataframe(scored, use_container_width=True)
-                    st.dataframe(history, use_container_width=True)
-
-            with tab_ai:
-                st.subheader("🤖 Gemini AI Financial Analyst")
-                st.caption("Ask me anything about your current targets, risk metrics, or market sentiment.")
-                
-                if "GEMINI_API_KEY" in st.secrets:
-                    genai.configure(api_key=st.secrets["GEMINI_API_KEY"]) #type: ignore
-                    model = genai.GenerativeModel('gemini-1.5-flash') # type: ignore
-                    
-                    if "chat_history" not in st.session_state:
-                        st.session_state.chat_history = []
-                        
-                    for msg in st.session_state.chat_history:
-                        st.chat_message(msg["role"]).write(msg["content"])
-                        
-                    if user_query := st.chat_input("e.g., 'Should I sell at the current price?'"):
-                        st.session_state.chat_history.append({"role": "user", "content": user_query})
-                        st.chat_message("user").write(user_query)
-                        
-                        context = f"""
-                        You are a quantitative risk analyst. Answer concisely based on these live metrics:
-                        - Ticker: {ticker}
-                        - Current Spot Price: {sym}{s0:.2f}
-                        - Entry / Cost Basis: {sym}{entry_price:.2f}
-                        - 14-Day RSI: {rsi:.1f}
-                        - 3-Day ML Dip Probability: {prob_dip*100:.1f}%
-                        - Target Buy Limit: {sym}{optimal_buy:.2f}
-                        - Target Sell Limit: {sym}{optimal_sell:.2f}
-                        - Take Profit Target: {sym}{target_tp:.2f}
-                        - Stop Loss Limit: {sym}{target_sl:.2f}
-                        - News Sentiment Score: {sentiment_score:+.2f}
-                        """
-                        prompt = f"{context}\n\nUser Question: {user_query}"
-                        
-                        with st.spinner("Analyzing data..."):
-                            try:
-                                response = model.generate_content(prompt)
-                                st.session_state.chat_history.append({"role": "assistant", "content": response.text})
-                                st.chat_message("assistant").write(response.text)
-                            except Exception as e:
-                                st.error(f"API Error: {e}")
-                else:
-                    st.warning("⚠️ API Key missing. Please add your GEMINI_API_KEY to your Streamlit App settings.")
+        if user_query := st.chat_input("e.g., 'Should I sell at the current price?'"):
+            st.session_state.chat_history.append({"role": "user", "content": user_query})
+            st.chat_message("user").write(user_query)
+            
+            context = f"""
+            You are a quantitative risk analyst. Answer concisely based on these live metrics:
+            - Ticker: {ticker}
+            - Current Spot Price: {sym}{s0:.2f}
+            - Entry / Cost Basis: {sym}{entry_price:.2f}
+            - 14-Day RSI: {rsi:.1f}
+            - 3-Day ML Dip Probability: {prob_dip*100:.1f}%
+            - Target Buy Limit: {sym}{optimal_buy:.2f}
+            - Target Sell Limit: {sym}{optimal_sell:.2f}
+            - Take Profit Target: {sym}{target_tp:.2f}
+            - Stop Loss Limit: {sym}{target_sl:.2f}
+            - News Sentiment Score: {sentiment_score:+.2f}
+            """
+            prompt = f"{context}\n\nUser Question: {user_query}"
+            
+            with st.spinner("Analyzing data..."):
+                try:
+                    response = model.generate_content(prompt)
+                    st.session_state.chat_history.append({"role": "assistant", "content": response.text})
+                    st.chat_message("assistant").write(response.text)
+                except Exception as e:
+                    st.error(f"API Error: {e}")
+    else:
+        st.warning("⚠️ API Key missing. Please add your GEMINI_API_KEY to your Streamlit App settings.")
