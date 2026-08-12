@@ -10,14 +10,28 @@ from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from transformers import pipeline
 import google.generativeai as genai
-
+# 1. THIS MUST BE THE VERY FIRST STREAMLIT COMMAND
 st.set_page_config(page_title="Quant Trade & Risk Engine", page_icon="⚡", layout="wide")
 
-# ------------------------------------------------------------------------
+# 2. Initialize the session state
+if "model_run" not in st.session_state:
+    st.session_state.model_run = False
+
+# 3. The Button updates the state
+if st.sidebar.button("Run Quantitative Model"):
+    st.session_state.model_run = True
+
+# 4. Stop the app from loading the rest of the code if False
+if not st.session_state.model_run:
+    st.info("👈 Please configure your parameters and click 'Run Quantitative Model' to begin.")
+    st.stop()  # This safely halts the script here!
+
+# ==========================================
 # 1. ML SENTIMENT ENGINE (FinBERT HuggingFace)
-# ------------------------------------------------------------------------
+# ==========================================
 @st.cache_resource(show_spinner="Loading FinBERT NLP Model...")
 def load_finbert():
+# ... the rest of your code stays exactly as it is, no indenting needed!
     try:
         return pipeline("text-classification", model="ProsusAI/finbert", top_k=None)
     except Exception:
