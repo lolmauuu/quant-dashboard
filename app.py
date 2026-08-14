@@ -407,7 +407,7 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
     try:
         # 1. Download target ticker safely
         df_raw = yf.download(ticker, period="5y", progress=False)
-        if df_raw.empty:
+        if df_raw is None or df_raw.empty:
             return None
         
         # Format Close price column cleanly
@@ -420,19 +420,27 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
 
         # 2. Fetch SPY with fallback if download fails
         try:
-            spy_data = yf.download("SPY", period="5y", progress=False)["Close"]
-            if isinstance(spy_data, pd.DataFrame):
-                spy_data = spy_data.squeeze()
-            df["SPY_Close"] = spy_data
+            spy_download = yf.download("SPY", period="5y", progress=False)
+            if spy_download is not None:
+                spy_data = spy_download["Close"]
+                if isinstance(spy_data, pd.DataFrame):
+                    spy_data = spy_data.squeeze()
+                df["SPY_Close"] = spy_data
+            else:
+                df["SPY_Close"] = df["Close"]
         except Exception:
             df["SPY_Close"] = df["Close"]
 
         # 3. Fetch ^VIX with fallback if download fails
         try:
-            vix_data = yf.download("^VIX", period="5y", progress=False)["Close"]
-            if isinstance(vix_data, pd.DataFrame):
-                vix_data = vix_data.squeeze()
-            df["VIX"] = vix_data
+            vix_download = yf.download("^VIX", period="5y", progress=False)
+            if vix_download is not None:
+                vix_data = vix_download["Close"]
+                if isinstance(vix_data, pd.DataFrame):
+                    vix_data = vix_data.squeeze()
+                df["VIX"] = vix_data
+            else:
+                df["VIX"] = 20.0
         except Exception:
             df["VIX"] = 20.0
 
