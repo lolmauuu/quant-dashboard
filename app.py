@@ -65,6 +65,7 @@ def fetch_news_and_sentiment(tk, max_items=8):
 # ------------------------------------------------------------------------
 # 2. MARKET DATA & TECHNICALS
 # ------------------------------------------------------------------------
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_stock_data(ticker):
     tk = yf.Ticker(ticker)
     hist = tk.history(period="2y", auto_adjust=True)
@@ -75,7 +76,7 @@ def fetch_stock_data(ticker):
     log_returns = pd.Series(np.log(price_series / price_series.shift(1))).dropna()
     daily_vol = float(log_returns.std())
     annual_vol = daily_vol * np.sqrt(252)
-    return s0, daily_vol, annual_vol, log_returns, price_series, tk
+    return s0, daily_vol, annual_vol, log_returns, price_series, datetime.now()
 
 def compute_technical_indicators(price_series):
     s0_now = float(price_series.iloc[-1])
@@ -342,6 +343,38 @@ def compute_calibration(scored_df, min_n=20):
     return cal, len(usable)
 
 # ------------------------------------------------------------------------
+# 5. PORTFOLIO HOLDINGS TRACKER
+# ------------------------------------------------------------------------
+PORTFOLIO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "portfolio.csv")
+PORTFOLIO_COLUMNS = ["Ticker", "Buy_Price", "Quantity", "Buy_Date"]
+
+def load_portfolio():
+    if not os.path.exists(PORTFOLIO_PATH):
+        return pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+    try:
+        df = pd.read_csv(PORTFOLIO_PATH)
+        for col in PORTFOLIO_COLUMNS:
+            if col not in df.columns:
+                df[col] = None
+        return df[PORTFOLIO_COLUMNS]
+    except Exception:
+        return pd.DataFrame(columns=PORTFOLIO_COLUMNS)
+
+def save_portfolio(df):
+    df.to_csv(PORTFOLIO_PATH, index=False)
+
+def currency_symbol_for(ticker):
+    return "RM " if str(ticker).upper().endswith(".KL") else "$"
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_latest_price(ticker):
+    try:
+        h = yf.Ticker(ticker).history(period="1d", auto_adjust=True)["Close"].dropna()
+        return float(h.iloc[-1]) if not h.empty else None
+    except Exception:
+        return None
+
+# ------------------------------------------------------------------------
 # STREAMLIT UI LAYOUT & SIDEBAR
 # ------------------------------------------------------------------------
 st.title("⚡ Quantitative Trade & Risk Engine")
@@ -377,11 +410,21 @@ if not st.session_state.model_run:
 # MAIN DASHBOARD EXECUTION
 # ------------------------------------------------------------------------
 with st.spinner(f"Running ML models & analytics for {ticker}..."):
-    s0, daily_vol, annual_vol, log_returns, price_series, tk = fetch_stock_data(ticker)
+    s0, daily_vol, annual_vol, log_returns, price_series, fetched_at = fetch_stock_data(ticker)
 
 if s0 is None:
     st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
     st.stop()
+
+tk = yf.Ticker(ticker)  # cheap - just wraps the symbol, no request until .news is accessed below
+
+fresh_col1, fresh_col2 = st.columns([4, 1])
+if fetched_at is not None:
+    fresh_col1.caption(f"📡 Price data as of **{fetched_at.strftime('%Y-%m-%d %H:%M:%S')}** "
+                        f"(auto-refreshes every 60s — every number below is from this one snapshot, so they'll always agree with each other).")
+if fresh_col2.button("🔄 Refresh now"):
+    fetch_stock_data.clear()
+    st.rerun()
 
 entry_price = entry_price_input if entry_price_input > 0 else s0
 
@@ -465,9 +508,70 @@ st.plotly_chart(fig, use_container_width=True)
 st.markdown("---")
 
 # --- DETAILED TABS ---
-tab_backtest, tab_news, tab_risk, tab_mc, tab_track, tab_ai = st.tabs([
-    "🧪 Historical Strategy Backtest", "📰 FinBERT News Feed", "⚠️ Risk Matrix", "🎲 Monte Carlo", "📒 Track Record", "🤖 AI Analyst"
+tab_portfolio, tab_backtest, tab_news, tab_risk, tab_mc, tab_track, tab_ai = st.tabs([
+    "💼 My Portfolio", "🧪 Historical Strategy Backtest", "📰 FinBERT News Feed", "⚠️ Risk Matrix", "🎲 Monte Carlo", "📒 Track Record", "🤖 AI Analyst"
 ])
+
+with tab_portfolio:
+    st.caption("What you actually hold - saved locally to portfolio.csv. Add, edit, or delete rows directly in the table below, then hit Save.")
+    portfolio_df = load_portfolio()
+
+    edited = st.data_editor(
+        portfolio_df, num_rows="dynamic", use_container_width=True, key="portfolio_editor",
+        column_config={
+            "Ticker": st.column_config.TextColumn("Ticker", required=True, help="e.g. SKHY or 0820EA.KL"),
+            "Buy_Price": st.column_config.NumberColumn("Buy Price", format="%.4f", required=True),
+            "Quantity": st.column_config.NumberColumn("Quantity", format="%.4f", required=True),
+            "Buy_Date": st.column_config.TextColumn("Buy Date (optional)"),
+        },
+    )
+
+    if st.button("💾 Save Portfolio"):
+        clean = edited.dropna(subset=["Ticker", "Buy_Price", "Quantity"]).copy()
+        clean["Ticker"] = clean["Ticker"].astype(str).str.upper().str.strip()
+        save_portfolio(clean)
+        st.success(f"Saved {len(clean)} holding(s).")
+        st.rerun()
+
+    holdings = portfolio_df.dropna(subset=["Ticker", "Buy_Price", "Quantity"])
+    if holdings.empty:
+        st.info("No holdings saved yet - add a row above (ticker, buy price, quantity) and hit Save.")
+    else:
+        st.markdown("---")
+        st.subheader("Live valuation")
+        rows = []
+        for _, r in holdings.iterrows():
+            live_price = fetch_latest_price(r["Ticker"])
+            cost = float(r["Buy_Price"]) * float(r["Quantity"])
+            mval = live_price * float(r["Quantity"]) if live_price is not None else None
+            pnl = (mval - cost) if mval is not None else None
+            pnl_pct = (pnl / cost * 100) if pnl is not None and cost else None
+            rows.append({
+                "Ticker": r["Ticker"], "Currency": currency_symbol_for(r["Ticker"]).strip() or "USD",
+                "Buy Price": r["Buy_Price"], "Qty": r["Quantity"], "Cost Basis": cost,
+                "Current Price": live_price, "Market Value": mval, "Unrealized P&L": pnl, "P&L %": pnl_pct,
+            })
+        val_df = pd.DataFrame(rows)
+        display_df = val_df.copy()
+        for col in ["Buy Price", "Current Price", "Cost Basis", "Market Value", "Unrealized P&L"]:
+            display_df[col] = display_df.apply(
+                lambda x: f"{currency_symbol_for(x['Ticker'])}{x[col]:,.2f}" if pd.notna(x[col]) else "N/A", axis=1)
+        display_df["P&L %"] = val_df["P&L %"].apply(lambda x: f"{x:+.2f}%" if pd.notna(x) else "N/A")
+        st.dataframe(display_df, use_container_width=True)
+
+        st.caption("Totals are grouped by currency - a MYR holding and a USD holding can't be summed together directly.")
+        for curr, grp in val_df.groupby("Currency"):
+            sym_g = "RM " if curr == "RM" else "$"
+            total_cost = grp["Cost Basis"].sum()
+            total_val = grp["Market Value"].sum(skipna=True) if grp["Market Value"].notna().any() else None
+            t1, t2, t3 = st.columns(3)
+            t1.metric(f"Cost Basis ({curr})", f"{sym_g}{total_cost:,.2f}")
+            t2.metric(f"Market Value ({curr})", f"{sym_g}{total_val:,.2f}" if total_val is not None else "N/A")
+            if total_val is not None:
+                pnl_total = total_val - total_cost
+                t3.metric(f"Unrealized P&L ({curr})", f"{sym_g}{pnl_total:,.2f}", f"{(pnl_total/total_cost*100):+.2f}%" if total_cost else None)
+            else:
+                t3.metric(f"Unrealized P&L ({curr})", "N/A")
 
 with tab_backtest:
     win_rate, total_ret, sharpe, max_dd = backtest_strategy(price_series, holding_days)
