@@ -407,11 +407,11 @@ def backtest_strategy(price_series, holding_days):
 def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, sl_pct=0.07, tp_pct=0.10):
     """Runs a 5-year walk-forward backtest simulating the core Quant Engine."""
     ticker = ticker.strip().upper()
-    
+ 
     try:
         # 1. Download target ticker safely
         df_raw = yf.download(ticker, period="5y", progress=False)
-        if df_raw is None or df_raw.empty:
+        if df_raw.empty:
             return None
         
         # Format Close price column cleanly
@@ -424,21 +424,15 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
 
         # 2. Fetch SPY with fallback if download fails
         try:
-            spy_data = yf.download("SPY", period="5y", progress=False)
-            if spy_data is not None and not spy_data.empty:
-                df["SPY_Close"] = spy_data["Close"]
-            else:
-                df["SPY_Close"] = df["Close"]  # Fallback to stock close
+            spy_data = yf.download("SPY", period="5y", progress=False)["Close"]
+            df["SPY_Close"] = spy_data
         except Exception:
             df["SPY_Close"] = df["Close"]  # Fallback to stock close
 
         # 3. Fetch ^VIX with fallback if download fails
         try:
-            vix_data = yf.download("^VIX", period="5y", progress=False)
-            if vix_data is not None and not vix_data.empty:
-                df["VIX"] = vix_data["Close"]
-            else:
-                df["VIX"] = 20.0  # Neutral baseline fallback
+            vix_data = yf.download("^VIX", period="5y", progress=False)["Close"]
+            df["VIX"] = vix_data
         except Exception:
             df["VIX"] = 20.0  # Neutral baseline fallback
 
