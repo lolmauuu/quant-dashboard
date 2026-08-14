@@ -340,7 +340,10 @@ if __name__ == "__main__":
     sentiment, hl_count = get_news_sentiment(tk)
     fund = fetch_fundamentals(tk)
     
-    t_years = holding_days / 365.0
+    # Use a 252-trading-day year to match how annual_vol was annualized
+    # (daily_vol * sqrt(252)) - mixing that with a 365-calendar-day t here
+    # understates sigma*sqrt(t) and throws off the B-S call/put + skew.
+    t_years = holding_days / 252.0
     r = 0.037
     bs_call = black_scholes_price(s0, s0, t_years, r, annual_vol, "call")
     bs_put = black_scholes_price(s0, s0, t_years, r, annual_vol, "put")

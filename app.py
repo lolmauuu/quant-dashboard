@@ -144,6 +144,7 @@ def run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days, sims=1000
     pop_pct = (np.sum(terminal_prices > entry_price) / sims) * 100.0
     return pop_pct, float(np.percentile(terminal_prices, 5)), float(np.percentile(terminal_prices, 95))
 
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_macro_regime():
     """Checks the broader market regime using the VIX and S&P 500 200-day SMA."""
     try:
@@ -157,6 +158,7 @@ def fetch_macro_regime():
     except Exception:
         return 20.0, False
 
+@st.cache_data(ttl=60, show_spinner=False)
 def fetch_options_sentiment(ticker):
     """Calculates the Put/Call Open Interest ratio for the nearest options expiration."""
     try:
@@ -176,11 +178,18 @@ def fetch_options_sentiment(ticker):
 
 def check_portfolio_correlation(new_ticker, portfolio_df):
     """Calculates how heavily correlated the new stock is to your existing holdings."""
+    if portfolio_df.empty:
+        return 0.0
+    tickers = tuple(sorted(portfolio_df["Ticker"].dropna().unique().tolist()))
+    return _check_portfolio_correlation_cached(new_ticker, tickers)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _check_portfolio_correlation_cached(new_ticker, tickers):
+    # tickers/new_ticker are hashable (tuple/str) so this can be cached, unlike
+    # a DataFrame - avoids re-hitting yfinance on every widget rerun.
     try:
-        if portfolio_df.empty:
-            return 0.0
-            
-        tickers = portfolio_df["Ticker"].dropna().unique().tolist()
+        tickers = list(tickers)
         if new_ticker not in tickers:
             tickers.append(new_ticker)
             
@@ -523,6 +532,18 @@ PREDICTION_LOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 LOG_COLUMNS = ["Timestamp", "Ticker", "Spot", "Buy_Target", "Sell_Target", "Dip_Prob", "Holding_Days"]
 
 def log_prediction(ticker, spot, buy_target, sell_target, dip_prob, holding_days):
+    # Streamlit reruns this whole script on every widget interaction (tab clicks,
+    # slider drags, chat messages, etc.) - not just on "Run Quantitative Model".
+    # Without a dedupe guard, this ends up writing near-identical rows to the CSV
+    # on every rerun, which quietly inflates the sample size and skews the
+    # win-rate / calibration numbers in the Track Record tab. We only log again
+    # once the underlying prediction actually changes for this ticker.
+    row_key = (ticker, round(float(spot), 2), round(float(buy_target), 2),
+               round(float(sell_target), 2), int(holding_days))
+    if st.session_state.get("last_logged_key") == row_key:
+        return
+    st.session_state["last_logged_key"] = row_key
+
     row = pd.DataFrame([{
         "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "Ticker": ticker, "Spot": spot, "Buy_Target": buy_target,
@@ -962,7 +983,8 @@ You are a quantitative risk analyst. Answer concisely based on these live metric
             prompt = f"{context}\n\nUser Question: {user_query}"
             with st.spinner("Analyzing data..."):
                 try:
-                    resp = genai.generate(prompt=prompt)  # type: ignore
+                    gemini_model = genai.GenerativeModel("gemini-2.5-flash")  # type: ignore
+                    resp = gemini_model.generate_content(prompt)
                     text = resp.text if hasattr(resp, "text") else str(resp)
                     st.session_state.chat_history.append({"role": "assistant", "content": text})
                     st.chat_message("assistant").write(text)
