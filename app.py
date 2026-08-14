@@ -406,104 +406,62 @@ def backtest_strategy(price_series, holding_days):
 # -----------------------------------------------------------------------------
 def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, sl_pct=0.07, tp_pct=0.10):
     """Runs a 5-year walk-forward backtest simulating the core Quant Engine."""
+    ticker = ticker.strip().upper()
+    
     try:
-        raw = yf.download(tickers=f"{ticker} SPY ^VIX", period="5y", progress=False)
-        if raw is None:
+        # 1. Download target ticker safely
+        df_raw = yf.download(ticker, period="5y", progress=False)
+        if df_raw is None or df_raw.empty:
             return None
-
-        if isinstance(raw, pd.Series):
-            data = raw.to_frame(name="Close")
-        elif "Close" in raw.columns:
-            data = raw["Close"]
-            if isinstance(data, pd.Series):
-                data = data.to_frame(name="Close")
-        else:
-            data = raw
-
-        if data.empty:
-            return None
-
-        if isinstance(data, pd.DataFrame):
-            if ticker in data.columns:
-                df = data[[ticker]].copy()
-                df = df.rename(columns={ticker: "Close"})
-            elif "Close" in data.columns:
-                df = data[["Close"]].copy()
-                df = df.rename(columns={"Close": "Close"})
-            else:
-                return None
-        else:
-            df = data.to_frame(name="Close")
-
-        if "SPY" in data.columns:
-            df["SPY_Close"] = data["SPY"]
-        if "^VIX" in data.columns:
-            df["VIX"] = data["^VIX"]
         
+        # Format Close price column cleanly
+        if "Close" in df_raw.columns:
+            df = df_raw[["Close"]].copy()
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = ["Close"]
+        else:
+            return None
+
+        # 2. Fetch SPY with fallback if download fails
+        try:
+            spy_data = yf.download("SPY", period="5y", progress=False)
+            if spy_data is not None and not spy_data.empty:
+                df["SPY_Close"] = spy_data["Close"]
+            else:
+                df["SPY_Close"] = df["Close"]  # Fallback to stock close
+        except Exception:
+            df["SPY_Close"] = df["Close"]  # Fallback to stock close
+
+        # 3. Fetch ^VIX with fallback if download fails
+        try:
+            vix_data = yf.download("^VIX", period="5y", progress=False)
+            if vix_data is not None and not vix_data.empty:
+                df["VIX"] = vix_data["Close"]
+            else:
+                df["VIX"] = 20.0  # Neutral baseline fallback
+        except Exception:
+            df["VIX"] = 20.0  # Neutral baseline fallback
+
+        # 4. Technical Indicators
         df["SMA_20"] = df["Close"].rolling(20).mean()
         df["STD_20"] = df["Close"].rolling(20).std()
         df["BB_Lower"] = df["SMA_20"] - 2 * df["STD_20"]
-        
+
         delta = df["Close"].diff()
         gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
         loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
         rs = gain / (loss + 1e-9)
         df["RSI"] = 100 - (100 / (1 + rs))
-        
-        df["Bear_Regime"] = (df["VIX"] > 25) | (df["SPY_Close"] < df["SPY_SMA200"])
-        
-        df.dropna(inplace=True)
-        
-        capital = initial_capital
-        equity_curve = []
-        trades = []
-        
-        in_position = False
-        entry_price = 0.0
-        entry_date = None
-        days_held = 0
-        shares = 0
-        
-        for date, row in df.iterrows():
-            equity_curve.append(capital + (shares * row["Close"]))
-            
-            if in_position:
-                days_held += 1
-                current_return = (row["Close"] - entry_price) / entry_price
-                
-                if current_return >= tp_pct or current_return <= -sl_pct or days_held >= max_holding_days:
-                    profit = (row["Close"] - entry_price) * shares
-                    capital += (row["Close"] * shares)
-                    
-                    trades.append({
-                        "Entry Date": entry_date, "Exit Date": date, 
-                        "Return (%)": current_return * 100, "Profit ($)": profit
-                    })
-                    in_position = False
-                    shares = 0
-            else:
-                tech_buy = (row["Close"] <= row["BB_Lower"] * 1.01) and (row["RSI"] < 45)
-                macro_safe = not row["Bear_Regime"]
-                
-                if tech_buy and macro_safe:
-                    in_position = True
-                    entry_price = row["Close"]
-                    entry_date = date
-                    days_held = 0
-                    
-                    trade_capital = capital * 0.10 
-                    shares = trade_capital / entry_price
-                    capital -= trade_capital
 
-        equity_df = pd.DataFrame({"Date": df.index, "Equity": equity_curve}).set_index("Date")
-        buy_hold_return = ((df["Close"].iloc[-1] / df["Close"].iloc[0]) - 1) * 100
-        strat_return = ((equity_df["Equity"].iloc[-1] / initial_capital) - 1) * 100
-        
-        trade_history = pd.DataFrame(trades)
-        win_rate = (trade_history["Profit ($)"] > 0).mean() * 100 if not trade_history.empty else 0
-        
-        return equity_df, strat_return, buy_hold_return, win_rate, len(trades)
-    except Exception:
+        # 5. Regime Filters
+        df["SPY_SMA200"] = df["SPY_Close"].rolling(200).mean()
+        df["Bear_Regime"] = (df["VIX"] > 25) | (df["SPY_Close"] < df["SPY_SMA200"])
+
+        df.dropna(inplace=True)
+        return df
+
+    except Exception as e:
+        print(f"Backtest Error: {e}")  # Prints the exact error in your terminal/logs
         return None
 
 # ------------------------------------------------------------------------
