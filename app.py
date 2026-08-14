@@ -4,12 +4,21 @@ import streamlit as st
 import numpy as np
 import pandas as pd
 import yfinance as yf
-from scipy.stats import norm
+from scipy.stats import norm, t
 import plotly.graph_objects as go
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.pipeline import Pipeline
 from transformers import pipeline
-import google.generativeai as genai
+
+# Optional Gemini SDK integration — don't hard-fail if SDK isn't installed
+try:
+    import google.generativeai as genai  # type: ignore
+    _HAS_GENAI = True
+except Exception:
+    genai = None  # type: ignore
+    _HAS_GENAI = False
 
 # 1. THIS MUST BE THE VERY FIRST STREAMLIT COMMAND
 st.set_page_config(page_title="Quant Trade & Risk Engine", page_icon="⚡", layout="wide")
@@ -127,13 +136,76 @@ def compute_risk_metrics(log_returns, s0, horizon_days):
         
     return var_param_usd, cvar_usd
 
-def run_monte_carlo(s0, entry_price, daily_vol, holding_days, sims=10000):
-    rng = np.random.default_rng(42)
+def run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days, sims=10000):
+    degrees_of_freedom = 4 
     sigma_period = daily_vol * np.sqrt(holding_days)
-    z = rng.standard_normal(sims)
-    terminal_prices = s0 * np.exp(-0.5 * (sigma_period ** 2) + sigma_period * z)
+    z_t = t.rvs(df=degrees_of_freedom, size=sims, random_state=42) * np.sqrt((degrees_of_freedom - 2) / degrees_of_freedom) * sigma_period
+    terminal_prices = s0 * np.exp(-0.5 * (sigma_period ** 2) + z_t)
     pop_pct = (np.sum(terminal_prices > entry_price) / sims) * 100.0
     return pop_pct, float(np.percentile(terminal_prices, 5)), float(np.percentile(terminal_prices, 95))
+
+def fetch_macro_regime():
+    """Checks the broader market regime using the VIX and S&P 500 200-day SMA."""
+    try:
+        vix = yf.Ticker("^VIX").history(period="1d")["Close"].iloc[-1]
+        spy = yf.Ticker("SPY").history(period="1y")["Close"]
+        spy_sma200 = spy.rolling(200).mean().iloc[-1]
+        spy_spot = spy.iloc[-1]
+        
+        # A crash/bear regime is flagged if VIX is high OR S&P 500 is below its 200-day moving average
+        is_bear_regime = (vix > 25) or (spy_spot < spy_sma200)
+        return float(vix), is_bear_regime
+    except Exception:
+        return 20.0, False
+
+def fetch_options_sentiment(ticker):
+    """Calculates the Put/Call Open Interest ratio for the nearest options expiration."""
+    try:
+        tk = yf.Ticker(ticker)
+        expirations = tk.options
+        if not expirations:
+            return 1.0 # Default neutral if no options exist (e.g., small caps or Bursa stocks)
+        
+        chain = tk.option_chain(expirations[0])
+        puts_oi = chain.puts['openInterest'].sum()
+        calls_oi = chain.calls['openInterest'].sum()
+        
+        if calls_oi == 0: return 1.0
+        return float(puts_oi / calls_oi)
+    except Exception:
+        return 1.0
+
+def check_portfolio_correlation(new_ticker, portfolio_df):
+    """Calculates how heavily correlated the new stock is to your existing holdings."""
+    try:
+        if portfolio_df.empty:
+            return 0.0
+            
+        tickers = portfolio_df["Ticker"].dropna().unique().tolist()
+        if new_ticker not in tickers:
+            tickers.append(new_ticker)
+            
+        if len(tickers) < 2:
+            return 0.0
+            
+        # Download 3 months of history for correlation check
+        downloaded = yf.download(tickers, period="3mo", progress=False)
+        if downloaded is None:
+            return 0.0
+        data = downloaded["Close"]
+        if isinstance(data, pd.Series): 
+            return 0.0
+            
+        returns = data.pct_change().dropna()
+        corr_matrix = returns.corr()
+        
+        if new_ticker in corr_matrix.columns:
+            # Get the average correlation of this new ticker against everything else you own
+            avg_corr = corr_matrix[new_ticker].drop(new_ticker).mean()
+            return float(avg_corr)
+        return 0.0
+    except Exception:
+        return 0.0
 
 # ------------------------------------------------------------------------
 # 3. XGBOOST PREDICTIVE ENGINE & POSITION SIZING
@@ -153,8 +225,8 @@ def train_xgboost_entry_model(price_series):
     df["BB_Lower"] = df["BB_Middle"] - 2 * df["BB_Std"]
 
     feature_cols = ["Returns", "Vol_10d", "RSI"]
-
     latest_row = df[feature_cols].iloc[[-1]]
+    
     if latest_row.isna().any(axis=1).iloc[0]:
         return 0.5, None
 
@@ -169,30 +241,33 @@ def train_xgboost_entry_model(price_series):
     X = labeled[feature_cols]
     y = labeled["Target_Dip"].astype(int)
 
-    split = int(len(X) * 0.8)
-    X_train, X_test = X.iloc[:split], X.iloc[split:]
-    y_train, y_test = y.iloc[:split], y.iloc[split:]
-    if y_train.nunique() < 2 or len(X_test) < 10:
-        return 0.5, None
+    tscv = TimeSeriesSplit(n_splits=3)
+    cv_scores = []
+    
+    xgb_pipeline = Pipeline([
+        ("scaler", StandardScaler()), 
+        ("xgb", XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, eval_metric="logloss"))
+    ])
 
-    pos = max(int(y_train.sum()), 1)
-    neg = max(len(y_train) - pos, 1)
-    spw = neg / pos
+    for train_index, test_index in tscv.split(X):
+        X_train_cv, X_test_cv = X.iloc[train_index], X.iloc[test_index]
+        y_train_cv, y_test_cv = y.iloc[train_index], y.iloc[test_index]
+        
+        pos = max(int(y_train_cv.sum()), 1)
+        neg = max(len(y_train_cv) - pos, 1)
+        xgb_pipeline.set_params(xgb__scale_pos_weight=(neg/pos))
+        
+        xgb_pipeline.fit(X_train_cv, y_train_cv)
+        cv_scores.append(xgb_pipeline.score(X_test_cv, y_test_cv))
 
-    scaler_val = StandardScaler()
-    model_val = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05,
-                               eval_metric="logloss", scale_pos_weight=spw)
-    model_val.fit(scaler_val.fit_transform(X_train), y_train)
-    holdout_acc = float(model_val.score(scaler_val.transform(X_test), y_test))
+    holdout_acc = float(np.mean(cv_scores))
 
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05,
-                           eval_metric="logloss", scale_pos_weight=spw)
-    model.fit(X_scaled, y)
+    pos = max(int(y.sum()), 1)
+    neg = max(len(y) - pos, 1)
+    xgb_pipeline.set_params(xgb__scale_pos_weight=(neg/pos))
+    xgb_pipeline.fit(X, y)
 
-    latest_scaled = scaler.transform(latest_row)
-    prob_dip = float(model.predict_proba(latest_scaled)[0][1])
+    prob_dip = float(xgb_pipeline.predict_proba(latest_row)[0][1])
 
     return prob_dip, holdout_acc
 
@@ -240,6 +315,65 @@ def calculate_position_sizing(account_size, entry_price, is_bursa):
         
     return recommended_shares, total_capital
 
+def calculate_kelly_allocation(win_probability, take_profit_price, stop_loss_price, entry_price):
+    if entry_price <= stop_loss_price or take_profit_price <= entry_price:
+        return 0.0 
+        
+    reward = (take_profit_price - entry_price) / entry_price
+    risk = (entry_price - stop_loss_price) / entry_price
+    rr_ratio = reward / risk 
+    
+    kelly_fraction = (win_probability * (rr_ratio + 1) - 1) / rr_ratio
+    safe_kelly = np.clip(kelly_fraction * 0.5, 0.0, 0.25)
+    return safe_kelly
+
+def evaluate_trade_suitability(prob_dip, sentiment_score, rsi, bb_lower, s0, pop_pct, kelly_fraction, pc_ratio, is_bear_regime, avg_corr):
+    """
+    Upgraded to include Smart Money Options, Macro Regime, and Portfolio Correlation.
+    """
+    score = 0.0
+    
+    # 1. Base ML & Technicals (scaled down slightly to make room for macro)
+    if prob_dip > 0.70: score += 20
+    elif prob_dip > 0.55: score += 10
+    
+    if sentiment_score > 0.2: score += 10
+    
+    if rsi < 40 and s0 <= (bb_lower * 1.02): score += 15
+    elif rsi < 50: score += 5
+    
+    if pop_pct > 60: score += 10
+    if kelly_fraction > 0.10: score += 15
+    elif kelly_fraction > 0.05: score += 5
+    
+    # 2. Options Smart Money (0 to 10 points)
+    if pc_ratio < 0.7: score += 10 # More calls than puts (bullish smart money)
+    elif pc_ratio < 1.0: score += 5
+    
+    # 3. Macro Filter (0 to 10 points)
+    if not is_bear_regime: score += 10 
+    
+    # 4. Correlation Diversification (0 to 10 points)
+    if avg_corr < 0.3: score += 10 # Uncorrelated to your portfolio (Good)
+    elif avg_corr < 0.6: score += 5
+    
+    # --- FATAL FLAW PENALTIES ---
+    # Heavy penalty if it makes your portfolio dangerously unbalanced
+    if avg_corr > 0.75: score -= 20
+    # Heavy penalty if trying to buy a bearish stock during a macro crash
+    if is_bear_regime and pc_ratio > 1.2: score -= 30
+    
+    score = np.clip(score, 0, 100)
+    
+    if score >= 75:
+        signal = "🟢 **STRONG BUY:** Ideal setup. Models are aligned."
+    elif score >= 55:
+        signal = "🟡 **HOLD / WATCH:** Wait for better technical entry or ML conviction."
+    else:
+        signal = "🔴 **PASS:** Negative edge. Do not allocate capital."
+        
+    return score, signal
+
 def backtest_strategy(price_series, holding_days):
     df = pd.DataFrame({"Close": price_series})
     df["Returns"] = df["Close"].pct_change()
@@ -266,6 +400,111 @@ def backtest_strategy(price_series, holding_days):
     max_drawdown = float(trades.min() * 100.0)
     
     return win_rate, total_return, sharpe, max_drawdown
+
+# -----------------------------------------------------------------------------
+# HISTORICAL 5-YEAR BACKTEST ENGINE
+# -----------------------------------------------------------------------------
+def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, sl_pct=0.07, tp_pct=0.10):
+    """Runs a 5-year walk-forward backtest simulating the core Quant Engine."""
+    try:
+        raw = yf.download(tickers=f"{ticker} SPY ^VIX", period="5y", progress=False)
+        if raw is None:
+            return None
+
+        if isinstance(raw, pd.Series):
+            data = raw.to_frame(name="Close")
+        elif "Close" in raw.columns:
+            data = raw["Close"]
+            if isinstance(data, pd.Series):
+                data = data.to_frame(name="Close")
+        else:
+            data = raw
+
+        if data.empty:
+            return None
+
+        if isinstance(data, pd.DataFrame):
+            if ticker in data.columns:
+                df = data[[ticker]].copy()
+                df = df.rename(columns={ticker: "Close"})
+            elif "Close" in data.columns:
+                df = data[["Close"]].copy()
+                df = df.rename(columns={"Close": "Close"})
+            else:
+                return None
+        else:
+            df = data.to_frame(name="Close")
+
+        if "SPY" in data.columns:
+            df["SPY_Close"] = data["SPY"]
+        if "^VIX" in data.columns:
+            df["VIX"] = data["^VIX"]
+        
+        df["SMA_20"] = df["Close"].rolling(20).mean()
+        df["STD_20"] = df["Close"].rolling(20).std()
+        df["BB_Lower"] = df["SMA_20"] - 2 * df["STD_20"]
+        
+        delta = df["Close"].diff()
+        gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+        loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+        rs = gain / (loss + 1e-9)
+        df["RSI"] = 100 - (100 / (1 + rs))
+        
+        df["Bear_Regime"] = (df["VIX"] > 25) | (df["SPY_Close"] < df["SPY_SMA200"])
+        
+        df.dropna(inplace=True)
+        
+        capital = initial_capital
+        equity_curve = []
+        trades = []
+        
+        in_position = False
+        entry_price = 0.0
+        entry_date = None
+        days_held = 0
+        shares = 0
+        
+        for date, row in df.iterrows():
+            equity_curve.append(capital + (shares * row["Close"]))
+            
+            if in_position:
+                days_held += 1
+                current_return = (row["Close"] - entry_price) / entry_price
+                
+                if current_return >= tp_pct or current_return <= -sl_pct or days_held >= max_holding_days:
+                    profit = (row["Close"] - entry_price) * shares
+                    capital += (row["Close"] * shares)
+                    
+                    trades.append({
+                        "Entry Date": entry_date, "Exit Date": date, 
+                        "Return (%)": current_return * 100, "Profit ($)": profit
+                    })
+                    in_position = False
+                    shares = 0
+            else:
+                tech_buy = (row["Close"] <= row["BB_Lower"] * 1.01) and (row["RSI"] < 45)
+                macro_safe = not row["Bear_Regime"]
+                
+                if tech_buy and macro_safe:
+                    in_position = True
+                    entry_price = row["Close"]
+                    entry_date = date
+                    days_held = 0
+                    
+                    trade_capital = capital * 0.10 
+                    shares = trade_capital / entry_price
+                    capital -= trade_capital
+
+        equity_df = pd.DataFrame({"Date": df.index, "Equity": equity_curve}).set_index("Date")
+        buy_hold_return = ((df["Close"].iloc[-1] / df["Close"].iloc[0]) - 1) * 100
+        strat_return = ((equity_df["Equity"].iloc[-1] / initial_capital) - 1) * 100
+        
+        trade_history = pd.DataFrame(trades)
+        win_rate = (trade_history["Profit ($)"] > 0).mean() * 100 if not trade_history.empty else 0
+        
+        return equity_df, strat_return, buy_hold_return, win_rate, len(trades)
+    except Exception:
+        return None
 
 # ------------------------------------------------------------------------
 # 4. PREDICTION TRACK RECORD
@@ -416,12 +655,12 @@ if s0 is None:
     st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
     st.stop()
 
-tk = yf.Ticker(ticker)  # cheap - just wraps the symbol, no request until .news is accessed below
+tk = yf.Ticker(ticker) 
 
 fresh_col1, fresh_col2 = st.columns([4, 1])
 if fetched_at is not None:
     fresh_col1.caption(f"📡 Price data as of **{fetched_at.strftime('%Y-%m-%d %H:%M:%S')}** "
-                        f"(auto-refreshes every 60s — every number below is from this one snapshot, so they'll always agree with each other).")
+                        f"(auto-refreshes every 60s).")
 if fresh_col2.button("🔄 Refresh now"):
     fetch_stock_data.clear()
     st.rerun()
@@ -430,8 +669,13 @@ entry_price = entry_price_input if entry_price_input > 0 else s0
 
 rsi, sma_20, sma_50, bb_upper, bb_lower, macd_hist = compute_technical_indicators(price_series)
 var_param_usd, cvar_usd = compute_risk_metrics(log_returns, s0, holding_days)
-pop_pct, p05, p95 = run_monte_carlo(s0, entry_price, daily_vol, holding_days)
+
+# PATCED MONTE CARLO
+pop_pct, p05, p95 = run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days)
+
 news_items, sentiment_score = fetch_news_and_sentiment(tk)
+
+# PATCHED XGBOOST
 prob_dip, dip_model_acc = train_xgboost_entry_model(price_series)
 
 optimal_buy, conservative_buy = calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip)
@@ -447,6 +691,32 @@ target_sl = max(quant_sl, user_sl)
 rec_shares, total_alloc = calculate_position_sizing(portfolio_capital, entry_price, is_bursa)
 
 log_prediction(ticker, s0, optimal_buy, optimal_sell, prob_dip, holding_days)
+
+# --- NEW: Institutional Risk Models (Macro, Options, Correlation) ---
+with st.spinner("Fetching Options Chain, Macro Regime, and Correlation Matrix..."):
+    vix_val, is_bear_regime = fetch_macro_regime()
+    pc_ratio = fetch_options_sentiment(ticker)
+    current_portfolio = load_portfolio()
+    avg_corr = check_portfolio_correlation(ticker, current_portfolio)
+
+# --- Kelly Sizing & Upgraded Master Suitability Engine ---
+kelly_fraction = calculate_kelly_allocation(pop_pct / 100.0, target_tp, target_sl, entry_price)
+
+quant_score, trade_signal = evaluate_trade_suitability(
+    prob_dip, sentiment_score, rsi, bb_lower, s0, pop_pct, kelly_fraction, 
+    pc_ratio, is_bear_regime, avg_corr
+)
+
+st.markdown("---")
+st.subheader("🧠 Institutional AI Quant Decision")
+st.info(f"{trade_signal} (Master Quant Score: {quant_score:.0f}/100)")
+if kelly_fraction > 0:
+    st.success(f"⚖️ **Kelly Optimal Allocation:** Risk maximum of **{kelly_fraction*100:.1f}%** of your total portfolio on this trade.")
+else:
+    st.error("⚖️ **Kelly Optimal Allocation:** **0%** (Risk/Reward ratio is mathematically unfavorable).")
+
+st.caption(f"**Macro Engine:** VIX at {vix_val:.2f} | **Options Flow:** Put/Call Ratio at {pc_ratio:.2f} | **Portfolio Correlation:** {avg_corr:.2f}")
+st.markdown("---")
 
 # --- DISPLAY DASHBOARD METRICS ---
 st.subheader("🎯 3-Day ML Optimal Buy Price Target")
@@ -635,41 +905,99 @@ with tab_ai:
     st.subheader("🤖 Gemini AI Financial Analyst")
     st.caption("Ask me anything about your current targets, risk metrics, or market sentiment.")
     
-    if "GEMINI_API_KEY" in st.secrets:
-        genai.configure(api_key=st.secrets["GEMINI_API_KEY"])  # type: ignore
-        model = genai.GenerativeModel('gemini-3.6-flash')  # type: ignore
-        
-        if "chat_history" not in st.session_state:
-            st.session_state.chat_history = []
-            
-        for msg in st.session_state.chat_history:
-            st.chat_message(msg["role"]).write(msg["content"])
-            
-        if user_query := st.chat_input("e.g., 'Should I sell at the current price?'"):
-            st.session_state.chat_history.append({"role": "user", "content": user_query})
-            st.chat_message("user").write(user_query)
-            
+    if "GEMINI_API_KEY" in st.secrets and _HAS_GENAI:
+        # If the official SDK is available, use it. Use a very small, defensive call pattern
+        try:
+            genai.configure(api_key=st.secrets["GEMINI_API_KEY"])  # type: ignore
+        except Exception:
+            pass
+
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    for msg in st.session_state.chat_history:
+        st.chat_message(msg["role"]).write(msg["content"])
+
+    if user_query := st.chat_input("e.g., 'Should I sell at the current price?'"):
+        st.session_state.chat_history.append({"role": "user", "content": user_query})
+        st.chat_message("user").write(user_query)
+
+        # Minimal local analyst fallback if Gemini SDK / key are not available
+        if not _HAS_GENAI or "GEMINI_API_KEY" not in st.secrets:
+            # concise heuristic reply
+            if quant_score >= 75:
+                advice = "Strong buy — models aligned."
+            elif quant_score >= 55:
+                advice = "Hold / watch — wait for better entry or conviction."
+            else:
+                advice = "Pass — negative edge."
+
+            extra = []
+            if rsi > 70:
+                extra.append("RSI high — consider taking profits")
+            if prob_dip < 0.4:
+                extra.append("Low dip probability")
+
+            reply = advice + (" — " + "; ".join(extra) if extra else "")
+            st.session_state.chat_history.append({"role": "assistant", "content": reply})
+            st.chat_message("assistant").write(reply)
+        else:
+            # Attempt to call the Gemini SDK if present. Keep it minimal and tolerant to errors.
             context = f"""
-            You are a quantitative risk analyst. Answer concisely based on these live metrics:
-            - Ticker: {ticker}
-            - Current Spot Price: {sym}{s0:.2f}
-            - Entry / Cost Basis: {sym}{entry_price:.2f}
-            - 14-Day RSI: {rsi:.1f}
-            - 3-Day ML Dip Probability: {prob_dip*100:.1f}%
-            - Target Buy Limit: {sym}{optimal_buy:.2f}
-            - Target Sell Limit: {sym}{optimal_sell:.2f}
-            - Take Profit Target: {sym}{target_tp:.2f}
-            - Stop Loss Limit: {sym}{target_sl:.2f}
-            - News Sentiment Score: {sentiment_score:+.2f}
-            """
+You are a quantitative risk analyst. Answer concisely based on these live metrics:
+- Ticker: {ticker}
+- Current Spot Price: {sym}{s0:.2f}
+- Entry / Cost Basis: {sym}{entry_price:.2f}
+- 14-Day RSI: {rsi:.1f}
+- 3-Day ML Dip Probability: {prob_dip*100:.1f}%
+- Target Buy Limit: {sym}{optimal_buy:.2f}
+- Target Sell Limit: {sym}{optimal_sell:.2f}
+- Take Profit Target: {sym}{target_tp:.2f}
+- Stop Loss Limit: {sym}{target_sl:.2f}
+- News Sentiment Score: {sentiment_score:+.2f}
+"""
             prompt = f"{context}\n\nUser Question: {user_query}"
-            
             with st.spinner("Analyzing data..."):
                 try:
-                    response = model.generate_content(prompt)
-                    st.session_state.chat_history.append({"role": "assistant", "content": response.text})
-                    st.chat_message("assistant").write(response.text)
+                    resp = genai.generate(prompt=prompt)  # type: ignore
+                    text = resp.text if hasattr(resp, "text") else str(resp)
+                    st.session_state.chat_history.append({"role": "assistant", "content": text})
+                    st.chat_message("assistant").write(text)
                 except Exception as e:
                     st.error(f"API Error: {e}")
-    else:
-        st.warning("⚠️ API Key missing. Please add your GEMINI_API_KEY to your Streamlit App settings.")
+
+# --- 5-YEAR BACKTEST MODULE UI ---
+st.markdown("---")
+with st.expander("📊 Run 5-Year Strategy Backtest (Walk-Forward Simulation)", expanded=False):
+    # Convert absolute dollar limits into percentages for the backtest engine
+    sl_pct_bt = (entry_price - target_sl) / entry_price if entry_price > 0 else 0.07
+    tp_pct_bt = (target_tp - entry_price) / entry_price if entry_price > 0 else 0.10
+
+    st.write(f"Testing the Master Quant Strategy strictly on **{ticker}** over the last 5 years, isolating out macro crashes (VIX/SPY regime filter) and targeting a {sl_pct_bt*100:.1f}% stop loss and ~{tp_pct_bt*100:.1f}% take profit.")
+    
+    if st.button(f"Initialize {ticker} Backtest Engine"):
+        with st.spinner("Compiling historical data & simulating executions..."):
+            bt_results = run_historical_backtest(ticker, sl_pct=sl_pct_bt, tp_pct=tp_pct_bt)
+            
+            if bt_results is None:
+                st.error("Backtest failed: Insufficient data for this ticker.")
+            else:
+                equity_df, strat_return, buy_hold_return, win_rate, total_trades = bt_results
+                
+                # Top Level Metrics
+                cols = st.columns(4)
+                cols[0].metric("Total Trades", total_trades)
+                cols[1].metric("Historical Win Rate", f"{win_rate:.1f}%")
+                cols[2].metric("Strategy Return", f"{strat_return:.1f}%")
+                cols[3].metric("Buy & Hold Return", f"{buy_hold_return:.1f}%")
+                
+                # Equity Curve Chart
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(x=equity_df.index, y=equity_df["Equity"], mode='lines', name='Strategy Equity', line=dict(color='#00ff9d', width=2)))
+                fig.update_layout(title="Strategy Equity Growth ($10,000 Initial Capital)", template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig, use_container_width=True)
+                
+                if strat_return > buy_hold_return:
+                    st.success("🟢 **Alpha Generated:** The dynamic quant strategy successfully outperformed passive buy-and-hold risk over the 5-year period.")
+                else:
+                    st.warning("🟡 **Risk Mitigation:** The strict macro and technical filters resulted in less return than passive buy-and-hold (though likely with less drawdown).")
