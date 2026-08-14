@@ -152,7 +152,6 @@ def fetch_macro_regime():
         spy_sma200 = spy.rolling(200).mean().iloc[-1]
         spy_spot = spy.iloc[-1]
         
-        # A crash/bear regime is flagged if VIX is high OR S&P 500 is below its 200-day moving average
         is_bear_regime = (vix > 25) or (spy_spot < spy_sma200)
         return float(vix), is_bear_regime
     except Exception:
@@ -164,7 +163,7 @@ def fetch_options_sentiment(ticker):
         tk = yf.Ticker(ticker)
         expirations = tk.options
         if not expirations:
-            return 1.0 # Default neutral if no options exist (e.g., small caps or Bursa stocks)
+            return 1.0 
         
         chain = tk.option_chain(expirations[0])
         puts_oi = chain.puts['openInterest'].sum()
@@ -188,7 +187,6 @@ def check_portfolio_correlation(new_ticker, portfolio_df):
         if len(tickers) < 2:
             return 0.0
             
-        # Download 3 months of history for correlation check
         downloaded = yf.download(tickers, period="3mo", progress=False)
         if downloaded is None:
             return 0.0
@@ -200,7 +198,6 @@ def check_portfolio_correlation(new_ticker, portfolio_df):
         corr_matrix = returns.corr()
         
         if new_ticker in corr_matrix.columns:
-            # Get the average correlation of this new ticker against everything else you own
             avg_corr = corr_matrix[new_ticker].drop(new_ticker).mean()
             return float(avg_corr)
         return 0.0
@@ -328,12 +325,8 @@ def calculate_kelly_allocation(win_probability, take_profit_price, stop_loss_pri
     return safe_kelly
 
 def evaluate_trade_suitability(prob_dip, sentiment_score, rsi, bb_lower, s0, pop_pct, kelly_fraction, pc_ratio, is_bear_regime, avg_corr):
-    """
-    Upgraded to include Smart Money Options, Macro Regime, and Portfolio Correlation.
-    """
     score = 0.0
     
-    # 1. Base ML & Technicals (scaled down slightly to make room for macro)
     if prob_dip > 0.70: score += 20
     elif prob_dip > 0.55: score += 10
     
@@ -346,21 +339,15 @@ def evaluate_trade_suitability(prob_dip, sentiment_score, rsi, bb_lower, s0, pop
     if kelly_fraction > 0.10: score += 15
     elif kelly_fraction > 0.05: score += 5
     
-    # 2. Options Smart Money (0 to 10 points)
-    if pc_ratio < 0.7: score += 10 # More calls than puts (bullish smart money)
+    if pc_ratio < 0.7: score += 10
     elif pc_ratio < 1.0: score += 5
     
-    # 3. Macro Filter (0 to 10 points)
     if not is_bear_regime: score += 10 
     
-    # 4. Correlation Diversification (0 to 10 points)
-    if avg_corr < 0.3: score += 10 # Uncorrelated to your portfolio (Good)
+    if avg_corr < 0.3: score += 10
     elif avg_corr < 0.6: score += 5
     
-    # --- FATAL FLAW PENALTIES ---
-    # Heavy penalty if it makes your portfolio dangerously unbalanced
     if avg_corr > 0.75: score -= 20
-    # Heavy penalty if trying to buy a bearish stock during a macro crash
     if is_bear_regime and pc_ratio > 1.2: score -= 30
     
     score = np.clip(score, 0, 100)
@@ -407,7 +394,7 @@ def backtest_strategy(price_series, holding_days):
 def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, sl_pct=0.07, tp_pct=0.10):
     """Runs a 5-year walk-forward backtest simulating the core Quant Engine."""
     ticker = ticker.strip().upper()
- 
+
     try:
         # 1. Download target ticker safely
         df_raw = yf.download(ticker, period="5y", progress=False)
@@ -425,16 +412,20 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
         # 2. Fetch SPY with fallback if download fails
         try:
             spy_data = yf.download("SPY", period="5y", progress=False)["Close"]
+            if isinstance(spy_data, pd.DataFrame):
+                spy_data = spy_data.squeeze()
             df["SPY_Close"] = spy_data
         except Exception:
-            df["SPY_Close"] = df["Close"]  # Fallback to stock close
+            df["SPY_Close"] = df["Close"]
 
         # 3. Fetch ^VIX with fallback if download fails
         try:
             vix_data = yf.download("^VIX", period="5y", progress=False)["Close"]
+            if isinstance(vix_data, pd.DataFrame):
+                vix_data = vix_data.squeeze()
             df["VIX"] = vix_data
         except Exception:
-            df["VIX"] = 20.0  # Neutral baseline fallback
+            df["VIX"] = 20.0
 
         # 4. Technical Indicators
         df["SMA_20"] = df["Close"].rolling(20).mean()
@@ -452,10 +443,77 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
         df["Bear_Regime"] = (df["VIX"] > 25) | (df["SPY_Close"] < df["SPY_SMA200"])
 
         df.dropna(inplace=True)
-        return df
+        if df.empty or len(df) < 50:
+            return None
+
+        # 6. Walk-Forward Simulation Loop
+        capital = float(initial_capital)
+        equity_curve = []
+        in_position = False
+        entry_price = 0.0
+        holding_count = 0
+        position_units = 0.0
+        trades = []
+
+        for i in range(len(df)):
+            price = float(df["Close"].iloc[i])
+            bb_low = float(df["BB_Lower"].iloc[i])
+            rsi_val = float(df["RSI"].iloc[i])
+            bear = bool(df["Bear_Regime"].iloc[i])
+
+            if in_position:
+                holding_count += 1
+                tp_price = entry_price * (1.0 + tp_pct)
+                sl_price = entry_price * (1.0 - sl_pct)
+
+                exit_trade = False
+                exit_price = price
+
+                if price >= tp_price:
+                    exit_trade = True
+                    exit_price = tp_price
+                elif price <= sl_price:
+                    exit_trade = True
+                    exit_price = sl_price
+                elif holding_count >= max_holding_days:
+                    exit_trade = True
+                    exit_price = price
+
+                if exit_trade:
+                    capital = position_units * exit_price
+                    pnl_pct = (exit_price - entry_price) / entry_price
+                    trades.append(pnl_pct)
+                    in_position = False
+                    entry_price = 0.0
+                    holding_count = 0
+                    position_units = 0.0
+                    current_equity = capital
+                else:
+                    current_equity = position_units * price
+            else:
+                if (price <= bb_low) and (rsi_val < 50) and (not bear):
+                    in_position = True
+                    entry_price = price
+                    holding_count = 0
+                    position_units = capital / price
+                current_equity = capital
+
+            equity_curve.append(current_equity)
+
+        equity_df = pd.DataFrame({"Equity": equity_curve}, index=df.index)
+
+        total_trades = len(trades)
+        win_rate = (sum(1 for t in trades if t > 0) / total_trades * 100.0) if total_trades > 0 else 0.0
+        strat_return = ((capital - initial_capital) / initial_capital) * 100.0
+
+        first_price = float(df["Close"].iloc[0])
+        last_price = float(df["Close"].iloc[-1])
+        buy_hold_return = ((last_price - first_price) / first_price) * 100.0
+
+        return equity_df, strat_return, buy_hold_return, win_rate, total_trades
 
     except Exception as e:
-        print(f"Backtest Error: {e}")  # Prints the exact error in your terminal/logs
+        print(f"Backtest Error: {e}")
         return None
 
 # ------------------------------------------------------------------------
@@ -622,12 +680,10 @@ entry_price = entry_price_input if entry_price_input > 0 else s0
 rsi, sma_20, sma_50, bb_upper, bb_lower, macd_hist = compute_technical_indicators(price_series)
 var_param_usd, cvar_usd = compute_risk_metrics(log_returns, s0, holding_days)
 
-# PATCED MONTE CARLO
 pop_pct, p05, p95 = run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days)
 
 news_items, sentiment_score = fetch_news_and_sentiment(tk)
 
-# PATCHED XGBOOST
 prob_dip, dip_model_acc = train_xgboost_entry_model(price_series)
 
 optimal_buy, conservative_buy = calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip)
@@ -644,14 +700,13 @@ rec_shares, total_alloc = calculate_position_sizing(portfolio_capital, entry_pri
 
 log_prediction(ticker, s0, optimal_buy, optimal_sell, prob_dip, holding_days)
 
-# --- NEW: Institutional Risk Models (Macro, Options, Correlation) ---
+# --- Institutional Risk Models ---
 with st.spinner("Fetching Options Chain, Macro Regime, and Correlation Matrix..."):
     vix_val, is_bear_regime = fetch_macro_regime()
     pc_ratio = fetch_options_sentiment(ticker)
     current_portfolio = load_portfolio()
     avg_corr = check_portfolio_correlation(ticker, current_portfolio)
 
-# --- Kelly Sizing & Upgraded Master Suitability Engine ---
 kelly_fraction = calculate_kelly_allocation(pop_pct / 100.0, target_tp, target_sl, entry_price)
 
 quant_score, trade_signal = evaluate_trade_suitability(
@@ -858,7 +913,6 @@ with tab_ai:
     st.caption("Ask me anything about your current targets, risk metrics, or market sentiment.")
     
     if "GEMINI_API_KEY" in st.secrets and _HAS_GENAI:
-        # If the official SDK is available, use it. Use a very small, defensive call pattern
         try:
             genai.configure(api_key=st.secrets["GEMINI_API_KEY"])  # type: ignore
         except Exception:
@@ -874,9 +928,7 @@ with tab_ai:
         st.session_state.chat_history.append({"role": "user", "content": user_query})
         st.chat_message("user").write(user_query)
 
-        # Minimal local analyst fallback if Gemini SDK / key are not available
         if not _HAS_GENAI or "GEMINI_API_KEY" not in st.secrets:
-            # concise heuristic reply
             if quant_score >= 75:
                 advice = "Strong buy — models aligned."
             elif quant_score >= 55:
@@ -894,7 +946,6 @@ with tab_ai:
             st.session_state.chat_history.append({"role": "assistant", "content": reply})
             st.chat_message("assistant").write(reply)
         else:
-            # Attempt to call the Gemini SDK if present. Keep it minimal and tolerant to errors.
             context = f"""
 You are a quantitative risk analyst. Answer concisely based on these live metrics:
 - Ticker: {ticker}
@@ -921,7 +972,6 @@ You are a quantitative risk analyst. Answer concisely based on these live metric
 # --- 5-YEAR BACKTEST MODULE UI ---
 st.markdown("---")
 with st.expander("📊 Run 5-Year Strategy Backtest (Walk-Forward Simulation)", expanded=False):
-    # Convert absolute dollar limits into percentages for the backtest engine
     sl_pct_bt = (entry_price - target_sl) / entry_price if entry_price > 0 else 0.07
     tp_pct_bt = (target_tp - entry_price) / entry_price if entry_price > 0 else 0.10
 
@@ -929,10 +979,15 @@ with st.expander("📊 Run 5-Year Strategy Backtest (Walk-Forward Simulation)", 
     
     if st.button(f"Initialize {ticker} Backtest Engine"):
         with st.spinner("Compiling historical data & simulating executions..."):
-            bt_results = run_historical_backtest(ticker, sl_pct=sl_pct_bt, tp_pct=tp_pct_bt)
+            bt_results = run_historical_backtest(
+                ticker, 
+                max_holding_days=holding_days, 
+                sl_pct=sl_pct_bt, 
+                tp_pct=tp_pct_bt
+            )
             
             if bt_results is None:
-                st.error("Backtest failed: Insufficient data for this ticker.")
+                st.error("Backtest failed: Insufficient data or failed download for this ticker.")
             else:
                 equity_df, strat_return, buy_hold_return, win_rate, total_trades = bt_results
                 
