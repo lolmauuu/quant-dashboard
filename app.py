@@ -92,8 +92,8 @@ def compute_technical_indicators(price_series):
     n = len(price_series)
 
     delta = price_series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     rs = gain / (loss + 1e-9)
     rsi_val = (100 - (100 / (1 + rs))).iloc[-1]
     rsi = float(rsi_val) if pd.notna(rsi_val) else 50.0
@@ -136,11 +136,16 @@ def compute_risk_metrics(log_returns, s0, horizon_days):
         
     return var_param_usd, cvar_usd
 
-def run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days, sims=10000):
+def run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days, sims=10000, mu_daily=0.0):
+    # mu_daily: expected daily log return (drift). Pass 0.0 for the old
+    # risk-neutral/martingale behavior (terminal price expectation = s0
+    # regardless of trend). Pass log_returns.mean() to have PoP reflect the
+    # stock's actual historical drift instead of assuming a flat expectation.
     degrees_of_freedom = 4 
     sigma_period = daily_vol * np.sqrt(holding_days)
+    drift_period = mu_daily * holding_days
     z_t = t.rvs(df=degrees_of_freedom, size=sims, random_state=42) * np.sqrt((degrees_of_freedom - 2) / degrees_of_freedom) * sigma_period
-    terminal_prices = s0 * np.exp(-0.5 * (sigma_period ** 2) + z_t)
+    terminal_prices = s0 * np.exp(drift_period - 0.5 * (sigma_period ** 2) + z_t)
     pop_pct = (np.sum(terminal_prices > entry_price) / sims) * 100.0
     return pop_pct, float(np.percentile(terminal_prices, 5)), float(np.percentile(terminal_prices, 95))
 
@@ -216,14 +221,15 @@ def _check_portfolio_correlation_cached(new_ticker, tickers):
 # ------------------------------------------------------------------------
 # 3. XGBOOST PREDICTIVE ENGINE & POSITION SIZING
 # ------------------------------------------------------------------------
-def train_xgboost_entry_model(price_series):
+@st.cache_resource(ttl=3600, show_spinner=False)
+def train_xgboost_entry_model(ticker, price_series):
     df = pd.DataFrame({"Close": price_series})
     df["Returns"] = df["Close"].pct_change()
     df["Vol_10d"] = df["Returns"].rolling(10).std()
 
     delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
 
     df["BB_Middle"] = df["Close"].rolling(20).mean()
@@ -250,9 +256,22 @@ def train_xgboost_entry_model(price_series):
     tscv = TimeSeriesSplit(n_splits=3)
     cv_scores = []
     
+    # --- UPDATED STOCHASTIC PIPELINE ---
     xgb_pipeline = Pipeline([
         ("scaler", StandardScaler()), 
-        ("xgb", XGBClassifier(n_estimators=50, max_depth=3, learning_rate=0.05, eval_metric="logloss"))
+        ("xgb", XGBClassifier(
+            n_estimators=150,          # More trees, but learning slower
+            learning_rate=0.01,        # Slower learning prevents jumping to false conclusions
+            max_depth=2,               # "Stumps" - very shallow trees to prevent memorizing exact prices
+            subsample=0.7,             # Randomly drop 30% of rows per tree (Stochastic boosting)
+            colsample_bytree=0.8,      # Randomly hide some indicators per tree
+            min_child_weight=3,        # Requires stronger evidence before making a split
+            gamma=0.1,                 # Minimum loss reduction required to make a new rule
+            reg_alpha=0.5,             # L1 Regularization (Lasso)
+            reg_lambda=1.0,            # L2 Regularization (Ridge)
+            eval_metric="logloss",
+            random_state=42            # Ensure reproducible results
+        ))
     ])
 
     for train_index, test_index in tscv.split(X):
@@ -276,6 +295,72 @@ def train_xgboost_entry_model(price_series):
     prob_dip = float(xgb_pipeline.predict_proba(latest_row)[0][1])
 
     return prob_dip, holdout_acc
+
+import scipy.optimize as sco
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def calculate_mpt_portfolio(tickers, risk_free_rate=0.03):
+    """
+    Downloads 2 years of historical data for the provided tickers,
+    calculates the covariance matrix, and finds the Maximum Sharpe Ratio allocation.
+    """
+    try:
+        # Fetch 2 years of daily data for all tickers
+        raw_data = yf.download(tickers, period="2y", interval="1d", auto_adjust=True)
+        
+        # Safety check to satisfy Pylance
+        if raw_data is None:
+            return None, "Failed to connect to Yahoo Finance."
+            
+        data = raw_data['Close']
+            
+        if isinstance(data, pd.Series):
+            data = data.to_frame()
+            
+        if data.empty or data.shape[1] < len(tickers):
+            return None, "Not enough data fetched for all tickers. Ensure tickers are correct."
+        
+        # Calculate daily returns, mean annual returns, and annual covariance matrix
+        returns = data.pct_change().dropna()
+        mean_returns = returns.mean(axis=0) * 252  # Added axis=0 to help Pylance
+        cov_matrix = returns.cov() * 252
+        num_assets = len(tickers)
+        
+        # Objective function: We want to MINIMIZE the negative Sharpe Ratio
+        def negative_sharpe(weights):
+            p_ret = np.sum(mean_returns * weights)
+            p_vol = np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights)))
+            return -(p_ret - risk_free_rate) / p_vol
+            
+        # Constraints: All weights must equal 100% (1.0). Bounds: No shorting (0 to 1).
+        constraints = ({'type': 'eq', 'fun': lambda x: np.sum(x) - 1})
+        bounds = tuple((0, 1) for _ in range(num_assets))
+        initial_guess = num_assets * [1. / num_assets]
+        
+        # Run the optimization solver
+        optimized = sco.minimize(negative_sharpe, initial_guess, method='SLSQP', bounds=bounds, constraints=constraints)
+        
+        if not optimized.success:
+            return None, "Optimization failed to converge."
+            
+        # Format the optimal weights into a clean Pandas DataFrame
+        optimal_weights = optimized.x
+        clean_weights = [round(w * 100, 2) for w in optimal_weights]
+        
+        opt_ret = np.sum(mean_returns * optimal_weights)
+        opt_vol = np.sqrt(np.dot(optimal_weights.T, np.dot(cov_matrix, optimal_weights)))
+        opt_sharpe = (opt_ret - risk_free_rate) / opt_vol
+        
+        result_df = pd.DataFrame({"Ticker": tickers, "Allocation %": clean_weights})
+        result_df = result_df[result_df["Allocation %"] > 0.1].sort_values(by="Allocation %", ascending=False)
+        
+        metrics = {"Return": opt_ret, "Volatility": opt_vol, "Sharpe": opt_sharpe}
+        
+        return result_df, metrics
+        
+    except Exception as e:
+        return None, str(e)
+
 
 def calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip):
     sigma_3d = daily_vol * np.sqrt(3)
@@ -378,8 +463,8 @@ def backtest_strategy(price_series, holding_days):
     df["BB_Lower"] = df["SMA_20"] - 2 * df["STD_20"]
     
     delta = df["Close"].diff()
-    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
     df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
     
     df["Signal"] = ((df["Close"] <= df["BB_Lower"]) & (df["RSI"] < 50)).astype(int)
@@ -397,9 +482,80 @@ def backtest_strategy(price_series, holding_days):
     
     return win_rate, total_return, sharpe, max_drawdown
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def optimize_dynamic_sl_tp(price_series, holding_days, daily_vol):
+    """
+    Runs a high-speed historical grid search to find the mathematically optimal 
+    Stop Loss and Take Profit volatility multipliers for this specific stock.
+    """
+    df = pd.DataFrame({"Close": price_series})
+    df["SMA_20"] = df["Close"].rolling(20).mean()
+    df["STD_20"] = df["Close"].rolling(20).std()
+    df["BB_Lower"] = df["SMA_20"] - 2 * df["STD_20"]
+    
+    delta = df["Close"].diff()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    df["RSI"] = 100 - (100 / (1 + (gain / (loss + 1e-9))))
+    
+    # Identify historical signals using your standardized rules
+    df["Signal"] = ((df["Close"] <= df["BB_Lower"]) & (df["RSI"] < 50)).astype(int)
+    
+    # Get raw integer locations of the signals to bypass Pylance index warnings
+    signal_indices = np.where(df["Signal"] == 1)[0]
+    
+    # Fallback to standard 1.0 / 1.5 if not enough historical dips to optimize
+    if len(signal_indices) < 5:
+        return 1.0, 1.5 
+        
+    # Test combinations of Stop Loss (0.5x to 2.5x) and Take Profit (1.0x to 3.5x)
+    sl_grid = np.arange(0.5, 3.0, 0.5) 
+    tp_grid = np.arange(1.0, 4.0, 0.5) 
+    
+    best_score = -np.inf
+    opt_sl, opt_tp = 1.0, 1.5
+    sigma_period = daily_vol * np.sqrt(holding_days)
+    
+    for sl in sl_grid:
+        for tp in tp_grid:
+            pnl_list = []
+            for raw_idx in signal_indices:
+                idx = int(raw_idx) # Explicit cast to int for Pylance
+                
+                if idx + holding_days >= len(df):
+                    continue
+                    
+                entry_price = float(df["Close"].iloc[idx])
+                stop_price = entry_price * (1 - sl * sigma_period)
+                take_price = entry_price * (1 + tp * sigma_period)
+                
+                # Walk forward simulation for this specific trade
+                forward_window = df["Close"].iloc[idx+1 : idx+1+holding_days]
+                trade_pnl = (float(forward_window.iloc[-1]) - entry_price) / entry_price 
+                
+                for price in forward_window:
+                    if price <= stop_price:
+                        trade_pnl = (stop_price - entry_price) / entry_price
+                        break
+                    elif price >= take_price:
+                        trade_pnl = (take_price - entry_price) / entry_price
+                        break
+                        
+                pnl_list.append(trade_pnl)
+                
+            if pnl_list:
+                # Score = Total Return * Win Rate (Penalizes strategies with massive SL but low win rates)
+                win_rate = sum(1 for p in pnl_list if p > 0) / len(pnl_list)
+                score = sum(pnl_list) * win_rate 
+                if score > best_score:
+                    best_score = score
+                    opt_sl, opt_tp = sl, tp
+                    
+    return opt_sl, opt_tp
 # -----------------------------------------------------------------------------
 # HISTORICAL 5-YEAR BACKTEST ENGINE
 # -----------------------------------------------------------------------------
+
 def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, sl_pct=0.07, tp_pct=0.10):
     """Runs a 5-year walk-forward backtest simulating the core Quant Engine."""
     ticker = ticker.strip().upper()
@@ -418,6 +574,22 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
         else:
             return None
 
+        # Normalize to tz-naive calendar dates. yfinance returns timestamps
+        # localized to each exchange's own timezone (e.g. Asia/Kuala_Lumpur
+        # for Bursa tickers vs America/New_York for SPY/VIX). Assigning a
+        # differently-tz'd Series straight onto df misaligns almost every
+        # row (midnight KL != midnight NY as a timestamp), so SPY_Close/VIX
+        # come back all-NaN and dropna() wipes the whole backtest for any
+        # non-US ticker like 0820EA.KL.
+        def _naive_dates(s):
+            s = s.copy()
+            if isinstance(s.index, pd.DatetimeIndex) and s.index.tz is not None:
+                s.index = s.index.tz_localize(None)
+            s.index = s.index.normalize()
+            return s[~s.index.duplicated(keep="last")]
+
+        df = _naive_dates(df["Close"]).to_frame("Close")
+
         # 2. Fetch SPY with fallback if download fails
         try:
             spy_download = yf.download("SPY", period="5y", progress=False)
@@ -425,7 +597,12 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
                 spy_data = spy_download["Close"]
                 if isinstance(spy_data, pd.DataFrame):
                     spy_data = spy_data.squeeze()
-                df["SPY_Close"] = spy_data
+                spy_data = _naive_dates(spy_data)
+                # Different exchanges also don't share a holiday calendar,
+                # so even after tz-fixing, a hard index match would still
+                # drop valid Bursa trading days that aren't US trading days.
+                # Forward-fill onto df's actual trading days instead.
+                df["SPY_Close"] = spy_data.reindex(df.index, method="ffill")
             else:
                 df["SPY_Close"] = df["Close"]
         except Exception:
@@ -438,11 +615,17 @@ def run_historical_backtest(ticker, initial_capital=10000, max_holding_days=10, 
                 vix_data = vix_download["Close"]
                 if isinstance(vix_data, pd.DataFrame):
                     vix_data = vix_data.squeeze()
-                df["VIX"] = vix_data
+                vix_data = _naive_dates(vix_data)
+                df["VIX"] = vix_data.reindex(df.index, method="ffill")
             else:
                 df["VIX"] = 20.0
         except Exception:
             df["VIX"] = 20.0
+
+        # SPY/VIX can still have leading NaNs before their own history starts;
+        # backfill those few rows rather than let dropna() nuke the dataframe.
+        df["SPY_Close"] = df["SPY_Close"].bfill()
+        df["VIX"] = df["VIX"].bfill().fillna(20.0)
 
         # 4. Technical Indicators
         df["SMA_20"] = df["Close"].rolling(20).mean()
@@ -669,10 +852,17 @@ ticker = st.sidebar.text_input("Ticker Symbol (e.g. SKHY or 1155.KL)", value="SK
 is_bursa = ticker.endswith(".KL") or "MYR" in currency_option
 sym = "RM " if "MYR" in currency_option or ticker.endswith(".KL") else "$"
 
-default_capital = 740.00 if is_bursa else 64.00
+default_capital = 0.00 if is_bursa else 0.00
 entry_price_input = st.sidebar.number_input(f"Cost Basis / Entry Price ({sym})", value=134.00 if ticker == "SKHY" else 1.88, step=0.01)
 portfolio_capital = st.sidebar.number_input(f"Available Capital ({sym})", value=default_capital, step=10.00)
-holding_days = st.sidebar.slider("Holding Horizon (Trading Days)", min_value=1, max_value=60, value=10)
+holding_days = st.sidebar.number_input(
+    "Holding Horizon (Trading Days)", 
+    min_value=1, 
+    max_value=1260, # Allows up to ~5 years of trading days
+    value=10, 
+    step=1,
+    help="Note: There are roughly 252 trading days in a year, not 365."
+)
 max_risk_pct = st.sidebar.slider("Max Acceptable Loss Limit (%)", min_value=1.0, max_value=20.0, value=7.0, step=0.5)
 
 # Single primary action button updates session state
@@ -690,7 +880,7 @@ if not st.session_state.model_run:
 with st.spinner(f"Running ML models & analytics for {ticker}..."):
     s0, daily_vol, annual_vol, log_returns, price_series, fetched_at = fetch_stock_data(ticker)
 
-if s0 is None:
+if s0 is None or log_returns is None:
     st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
     st.stop()
 
@@ -709,21 +899,31 @@ entry_price = entry_price_input if entry_price_input > 0 else s0
 rsi, sma_20, sma_50, bb_upper, bb_lower, macd_hist = compute_technical_indicators(price_series)
 var_param_usd, cvar_usd = compute_risk_metrics(log_returns, s0, holding_days)
 
-pop_pct, p05, p95 = run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days)
+pop_pct, p05, p95 = run_monte_carlo_fat_tail(s0, entry_price, daily_vol, holding_days, mu_daily=float(log_returns.mean()))
 
 news_items, sentiment_score = fetch_news_and_sentiment(tk)
 
-prob_dip, dip_model_acc = train_xgboost_entry_model(price_series)
+prob_dip, dip_model_acc = train_xgboost_entry_model(ticker, price_series)
 
 optimal_buy, conservative_buy = calculate_3day_buy_target(s0, daily_vol, bb_lower, sma_20, sentiment_score, prob_dip)
 optimal_sell, aggressive_sell, sigma_h_exit = calculate_optimal_sell_target(
     s0, daily_vol, bb_upper, sma_20, rsi, sentiment_score, holding_days
 )
+# Call the optimizer
+with st.spinner("Running walk-forward SL/TP grid optimization..."):
+    opt_sl_mult, opt_tp_mult = optimize_dynamic_sl_tp(price_series, holding_days, daily_vol)
+
 sigma_period = daily_vol * np.sqrt(holding_days)
-target_tp = entry_price * (1 + 1.5 * sigma_period)
-quant_sl = entry_price * (1 - 1.0 * sigma_period)
+
+# Apply the mathematically optimal multipliers
+target_tp = entry_price * (1 + opt_tp_mult * sigma_period)
+quant_sl = entry_price * (1 - opt_sl_mult * sigma_period)
+
 user_sl = entry_price * (1 - max_risk_pct / 100.0)
 target_sl = max(quant_sl, user_sl)
+
+# Optional: Print the applied multipliers so you can see the engine working
+st.sidebar.caption(f"⚙️ **Auto-Optimized Multipliers:** SL ({opt_sl_mult}x) | TP ({opt_tp_mult}x)")
 
 rec_shares, total_alloc = calculate_position_sizing(portfolio_capital, entry_price, is_bursa)
 
@@ -900,6 +1100,8 @@ with tab_risk:
 with tab_mc:
     st.write(f"**Probability of Profit (PoP):** `{pop_pct:.1f}%`")
     st.write(f"**5th–95th Tail Percentiles:** `{sym}{p05:.2f}` to `{sym}{p95:.2f}`")
+    st.caption("Simulation uses the stock's own historical drift (mean daily return), not a flat 50/50 assumption — "
+               "so a strong uptrend or downtrend will pull PoP accordingly.")
 
 with tab_track:
     st.caption("Every run logs itself automatically.")
@@ -998,6 +1200,48 @@ You are a quantitative risk analyst. Answer concisely based on these live metric
                     st.chat_message("assistant").write(text)
                 except Exception as e:
                     st.error(f"API Error: {e}")
+st.markdown("---")
+st.header("💼 Modern Portfolio Theory (MPT) Allocator")
+st.write("Input a comma-separated watchlist. The engine will calculate the covariance between these assets and find the exact capital allocation required to achieve the Maximum Sharpe Ratio (Highest Return / Lowest Risk).")
+
+mpt_tickers_input = st.text_input("Enter tickers (e.g., AAPL, MSFT, GLD, TSLA):", "AAPL, MSFT, GLD")
+
+if st.button("Calculate Optimal Portfolio"):
+    # Clean up the user input
+    tickers_list = [t.strip().upper() for t in mpt_tickers_input.split(",") if t.strip()]
+    
+    if len(tickers_list) < 2:
+        st.warning("Please enter at least 2 tickers to run the optimizer.")
+    else:
+        with st.spinner(f"Running millions of mathematical combinations for {len(tickers_list)} assets..."):
+            mpt_df, mpt_metrics = calculate_mpt_portfolio(tickers_list)
+            
+            if mpt_df is None or not isinstance(mpt_metrics, dict):
+                st.error(f"Error: {mpt_metrics}")
+            else:
+                st.success(f"Optimization Complete! Maximum Risk-Adjusted Sharpe Ratio: **{mpt_metrics['Sharpe']:.2f}**")
+                
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.dataframe(mpt_df, use_container_width=True, hide_index=True)
+                    st.metric("Expected Annual Return", f"{mpt_metrics['Return']*100:.1f}%")
+                    st.metric("Expected Annual Volatility", f"{mpt_metrics['Volatility']*100:.1f}%")
+                
+                with col2:
+                    # Render an interactive Plotly Donut Chart
+                    fig = go.Figure(data=[go.Pie(
+                        labels=mpt_df['Ticker'], 
+                        values=mpt_df['Allocation %'], 
+                        hole=.4,
+                        marker=dict(colors=['#00ff9d', '#00b8ff', '#9d00ff', '#ff009d', '#ffb800'])
+                    )])
+                    fig.update_layout(
+                        title="Optimal Capital Allocation Weighting", 
+                        template="plotly_dark",
+                        margin=dict(t=40, b=0, l=0, r=0)
+                    )
+                    st.plotly_chart(fig, use_container_width=True)
+
 
 # --- 5-YEAR BACKTEST MODULE UI ---
 st.markdown("---")
