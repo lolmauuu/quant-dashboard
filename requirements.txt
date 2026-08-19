@@ -1,7 +1,7 @@
 streamlit
 numpy
 pandas
-yfinance
+yfinance>=0.2.50
 scipy
 plotly
 xgboost
@@ -9,3 +9,4 @@ scikit-learn
 transformers
 torch
 google-generativeai
+requests

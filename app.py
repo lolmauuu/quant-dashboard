@@ -79,19 +79,25 @@ def fetch_news_and_sentiment(tk, max_items=8):
 def fetch_stock_data(ticker):
     session = requests.Session()
     session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     })
     
-    tk = yf.Ticker(ticker, session=session)
-    hist = tk.history(period="2y", auto_adjust=True)
-    if hist.empty:
+    try:
+        tk = yf.Ticker(ticker, session=session)
+        hist = tk.history(period="2y", auto_adjust=True)
+        if hist.empty:
+            return None, None, None, None, None, None
+            
+        price_series = hist["Close"].dropna()
+        s0 = float(price_series.iloc[-1])
+        log_returns = pd.Series(np.log(price_series / price_series.shift(1))).dropna()
+        daily_vol = float(log_returns.std())
+        annual_vol = daily_vol * np.sqrt(252)
+        return s0, daily_vol, annual_vol, log_returns, price_series, datetime.now()
+        
+    except Exception:
+        # Prevents YFRateLimitError from crashing the entire Streamlit page
         return None, None, None, None, None, None
-    price_series = hist["Close"].dropna()
-    s0 = float(price_series.iloc[-1])
-    log_returns = pd.Series(np.log(price_series / price_series.shift(1))).dropna()
-    daily_vol = float(log_returns.std())
-    annual_vol = daily_vol * np.sqrt(252)
-    return s0, daily_vol, annual_vol, log_returns, price_series, datetime.now()
 
 def compute_technical_indicators(price_series):
     s0_now = float(price_series.iloc[-1])
@@ -891,7 +897,7 @@ with st.spinner(f"Running ML models & analytics for {ticker}..."):
     s0, daily_vol, annual_vol, log_returns, price_series, fetched_at = fetch_stock_data(ticker)
 
 if s0 is None or log_returns is None:
-    st.error(f"Could not load market data for '{ticker}'. For Bursa stocks, remember to add `.KL` (e.g., `1155.KL`).")
+    st.error(f"Could not load market data for '{ticker}'. Yahoo Finance may be temporarily rate-limiting requests, or the ticker symbol is invalid.")
     st.stop()
 
 tk = yf.Ticker(ticker) 
