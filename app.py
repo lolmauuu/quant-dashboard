@@ -6,6 +6,7 @@ import pandas as pd
 import yfinance as yf
 from scipy.stats import norm, t
 import plotly.graph_objects as go
+import requests
 from xgboost import XGBClassifier
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import TimeSeriesSplit
@@ -74,9 +75,14 @@ def fetch_news_and_sentiment(tk, max_items=8):
 # ------------------------------------------------------------------------
 # 2. MARKET DATA & TECHNICALS
 # ------------------------------------------------------------------------
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_stock_data(ticker):
-    tk = yf.Ticker(ticker)
+    session = requests.Session()
+    session.headers.update({
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    })
+    
+    tk = yf.Ticker(ticker, session=session)
     hist = tk.history(period="2y", auto_adjust=True)
     if hist.empty:
         return None, None, None, None, None, None
@@ -306,6 +312,10 @@ def calculate_mpt_portfolio(tickers, risk_free_rate=0.03):
     """
     try:
         # Fetch 2 years of daily data for all tickers
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        })
         raw_data = yf.download(tickers, period="2y", interval="1d", auto_adjust=True)
         
         # Safety check to satisfy Pylance
